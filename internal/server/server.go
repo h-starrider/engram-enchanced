@@ -249,7 +249,8 @@ func (s *Server) handleRecentObservations(w http.ResponseWriter, r *http.Request
 	scope := r.URL.Query().Get("scope")
 	limit := queryInt(r, "limit", 20)
 
-	obs, err := s.store.RecentObservations(project, scope, limit)
+	tier := r.URL.Query().Get("tier")
+	obs, err := s.store.RecentObservations(project, scope, limit, tier)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -270,6 +271,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		Project: r.URL.Query().Get("project"),
 		Scope:   r.URL.Query().Get("scope"),
 		Limit:   queryInt(r, "limit", 10),
+		Tier:    r.URL.Query().Get("tier"),
 	})
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
@@ -287,7 +289,8 @@ func (s *Server) handleGetObservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	obs, err := s.store.GetObservation(id)
+	tier := r.URL.Query().Get("tier")
+	obs, err := s.store.GetObservation(id, tier)
 	if err != nil {
 		jsonError(w, http.StatusNotFound, "observation not found")
 		return
@@ -474,7 +477,8 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	project := r.URL.Query().Get("project")
 	scope := r.URL.Query().Get("scope")
 
-	context, err := s.store.FormatContext(project, scope)
+	tier := r.URL.Query().Get("tier")
+	context, err := s.store.FormatContext(project, scope, tier)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return

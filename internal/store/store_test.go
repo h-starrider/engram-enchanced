@@ -156,7 +156,7 @@ func TestScopeFiltersSearchAndContext(t *testing.T) {
 		t.Fatalf("expected 1 personal-scope result, got %d", len(personalResults))
 	}
 
-	ctx, err := s.FormatContext("engram", "personal")
+	ctx, err := s.FormatContext("engram", "personal", "")
 	if err != nil {
 		t.Fatalf("format context personal: %v", err)
 	}
@@ -1590,7 +1590,7 @@ func TestStoreAdditionalQueryAndMutationBranches(t *testing.T) {
 		t.Fatalf("expected search results")
 	}
 
-	ctx, err := s.FormatContext("", "project")
+	ctx, err := s.FormatContext("", "project", "")
 	if err != nil {
 		t.Fatalf("format context: %v", err)
 	}
@@ -1755,7 +1755,7 @@ func TestMigrationAndHelperEdgeBranches(t *testing.T) {
 
 	t.Run("format context empty returns empty string", func(t *testing.T) {
 		s := newTestStore(t)
-		ctx, err := s.FormatContext("", "")
+		ctx, err := s.FormatContext("", "", "")
 		if err != nil {
 			t.Fatalf("format context: %v", err)
 		}
@@ -2296,7 +2296,7 @@ func TestHookFallbacksAndAdditionalBranches(t *testing.T) {
 		t.Run("recent sessions error", func(t *testing.T) {
 			s := newTestStore(t)
 			_ = s.Close()
-			if _, err := s.FormatContext("", ""); err == nil {
+			if _, err := s.FormatContext("", "", ""); err == nil {
 				t.Fatalf("expected format context to fail from recent sessions")
 			}
 		})
@@ -2309,7 +2309,7 @@ func TestHookFallbacksAndAdditionalBranches(t *testing.T) {
 			if _, err := s.db.Exec("DROP TABLE observations"); err != nil {
 				t.Fatalf("drop observations: %v", err)
 			}
-			if _, err := s.FormatContext("", ""); err == nil {
+			if _, err := s.FormatContext("", "", ""); err == nil {
 				t.Fatalf("expected format context to fail from recent observations")
 			}
 		})
@@ -2322,7 +2322,7 @@ func TestHookFallbacksAndAdditionalBranches(t *testing.T) {
 			if _, err := s.db.Exec("DROP TABLE user_prompts"); err != nil {
 				t.Fatalf("drop prompts: %v", err)
 			}
-			if _, err := s.FormatContext("", ""); err == nil {
+			if _, err := s.FormatContext("", "", ""); err == nil {
 				t.Fatalf("expected format context to fail from recent prompts")
 			}
 		})
@@ -2723,7 +2723,7 @@ func TestStoreUncoveredBranchesPushToHundred(t *testing.T) {
 			}
 			return origQueryIt(db, query, args...)
 		}
-		if _, err := s.FormatContext("engram", "project"); err == nil {
+		if _, err := s.FormatContext("engram", "project", ""); err == nil {
 			t.Fatalf("expected format context observations error")
 		}
 
@@ -2741,7 +2741,7 @@ func TestStoreUncoveredBranchesPushToHundred(t *testing.T) {
 			t.Fatalf("end session: %v", err)
 		}
 		s.hooks.queryIt = origQueryIt
-		ctx, err := s.FormatContext("engram", "project")
+		ctx, err := s.FormatContext("engram", "project", "")
 		if err != nil {
 			t.Fatalf("format context with summary: %v", err)
 		}
@@ -4176,5 +4176,256 @@ func TestEndSessionNoHeadersSkipsSilently(t *testing.T) {
 		if o.Type == "passive" {
 			t.Fatalf("expected zero passive observations for plain text summary, found one: %q", o.Title)
 		}
+	}
+}
+
+// ─── Tiered Content Loading Tests ────────────────────────────────────────────
+
+func TestSmartTruncateSentenceBoundary(t *testing.T) {
+	text := "First sentence. Second sentence. Third sentence is longer than expected."
+	result := smartTruncate(text, 35)
+	if result != "First sentence. Second sentence...." {
+		t.Fatalf("expected sentence boundary truncation, got %q", result)
+	}
+}
+
+func TestSmartTruncateWordBoundary(t *testing.T) {
+	// No sentence-ending punctuation, only spaces as boundaries
+	text := "one two three four five six seven eight nine ten eleven"
+	result := smartTruncate(text, 20)
+	if !strings.HasSuffix(result, "...") {
+		t.Fatalf("expected ... suffix, got %q", result)
+	}
+	if strings.Contains(result, "five") {
+		t.Fatalf("expected truncation before 'five', got %q", result)
+	}
+}
+
+func TestSmartTruncateHardCut(t *testing.T) {
+	text := "abcdefghijklmnopqrstuvwxyz"
+	result := smartTruncate(text, 10)
+	if result != "abcdefghij..." {
+		t.Fatalf("expected hard cut at 10 chars, got %q", result)
+	}
+}
+
+func TestSmartTruncateFitsWithinMaxLen(t *testing.T) {
+	text := "short text"
+	result := smartTruncate(text, 100)
+	if result != text {
+		t.Fatalf("expected unchanged text, got %q", result)
+	}
+}
+
+func TestSmartTruncateNewlineAsBoundary(t *testing.T) {
+	text := "First line\nSecond line\nThird line is much longer than expected here"
+	result := smartTruncate(text, 25)
+	if !strings.HasSuffix(result, "...") {
+		t.Fatalf("expected ... suffix, got %q", result)
+	}
+	// The \n at position 21 (after "Second line") should be the sentence boundary
+	if !strings.Contains(result, "Second line") || !strings.HasPrefix(result, "First line") {
+		t.Fatalf("expected newline as boundary capturing first two lines, got %q", result)
+	}
+}
+
+func TestContentExprL0L1L2(t *testing.T) {
+	l0 := contentExpr("", "L0")
+	if !strings.Contains(l0, "abstract") || !strings.Contains(l0, "SUBSTR") {
+		t.Fatalf("L0 should use COALESCE(abstract, SUBSTR), got %q", l0)
+	}
+	l1 := contentExpr("o.", "L1")
+	if !strings.Contains(l1, "o.overview") {
+		t.Fatalf("L1 should use o.overview, got %q", l1)
+	}
+	l2 := contentExpr("", "")
+	if l2 != "content" {
+		t.Fatalf("empty tier should return 'content', got %q", l2)
+	}
+	inv := contentExpr("", "invalid")
+	if inv != "content" {
+		t.Fatalf("invalid tier should return 'content', got %q", inv)
+	}
+}
+
+func generateLongContent(length int) string {
+	var b strings.Builder
+	sentence := "This is a test sentence with enough words to be meaningful. "
+	for b.Len() < length {
+		b.WriteString(sentence)
+	}
+	return b.String()[:length]
+}
+
+func TestAddObservationGeneratesAbstractAndOverview(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	longContent := generateLongContent(10000)
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1", Type: "manual", Title: "Long obs",
+		Content: longContent, Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	// Verify L0 returns short content
+	obsL0, err := s.GetObservation(id, "L0")
+	if err != nil {
+		t.Fatalf("GetObservation L0: %v", err)
+	}
+	if len(obsL0.Content) > 510 {
+		t.Fatalf("L0 content should be <=~503 chars, got %d", len(obsL0.Content))
+	}
+
+	// Verify L1 returns medium content
+	obsL1, err := s.GetObservation(id, "L1")
+	if err != nil {
+		t.Fatalf("GetObservation L1: %v", err)
+	}
+	if len(obsL1.Content) > 8010 {
+		t.Fatalf("L1 content should be <=~8003 chars, got %d", len(obsL1.Content))
+	}
+
+	// Verify L2 returns full content
+	obsL2, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("GetObservation L2: %v", err)
+	}
+	if len(obsL2.Content) != len(longContent) {
+		t.Fatalf("L2 content should be full (%d), got %d", len(longContent), len(obsL2.Content))
+	}
+}
+
+func TestAddObservationMediumContent(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	mediumContent := generateLongContent(2000)
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1", Type: "manual", Title: "Medium obs",
+		Content: mediumContent, Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	obsL0, _ := s.GetObservation(id, "L0")
+	if len(obsL0.Content) > 510 {
+		t.Fatalf("L0 content should be truncated, got %d chars", len(obsL0.Content))
+	}
+	obsL1, _ := s.GetObservation(id, "L1")
+	if len(obsL1.Content) != len(mediumContent) {
+		t.Fatalf("L1 should be full content for medium obs, got %d vs %d", len(obsL1.Content), len(mediumContent))
+	}
+}
+
+func TestAddObservationShortContent(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	shortContent := "This is short content under 500 chars."
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1", Type: "manual", Title: "Short obs",
+		Content: shortContent, Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	obsL0, _ := s.GetObservation(id, "L0")
+	if obsL0.Content != shortContent {
+		t.Fatalf("L0 should equal full content for short obs, got %q", obsL0.Content)
+	}
+}
+
+func TestGetObservationDefaultIsL2(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	longContent := generateLongContent(5000)
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1", Type: "manual", Title: "Full obs",
+		Content: longContent, Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	obs, _ := s.GetObservation(id)
+	if len(obs.Content) != len(longContent) {
+		t.Fatalf("default tier should return full content, got %d vs %d", len(obs.Content), len(longContent))
+	}
+}
+
+func TestSearchWithTierL0(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	longContent := generateLongContent(5000)
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1", Type: "manual", Title: "Searchable tier test",
+		Content: longContent, Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	results, err := s.Search("tier test", SearchOptions{Project: "engram", Tier: "L0"})
+	if err != nil {
+		t.Fatalf("Search L0: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected search results")
+	}
+	if len(results[0].Content) > 510 {
+		t.Fatalf("L0 search result content should be short, got %d chars", len(results[0].Content))
+	}
+}
+
+func TestUpsertRegeneratesTiers(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// First: short content
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1", Type: "manual", Title: "Upsert test",
+		Content: "Short initial content.", Project: "engram", TopicKey: "test/upsert-tier",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	obsL0, _ := s.GetObservation(id, "L0")
+	if obsL0.Content != "Short initial content." {
+		t.Fatalf("L0 should be full short content, got %q", obsL0.Content)
+	}
+
+	// Second: long content via upsert
+	longContent := generateLongContent(5000)
+	_, err = s.AddObservation(AddObservationParams{
+		SessionID: "s1", Type: "manual", Title: "Upsert test",
+		Content: longContent, Project: "engram", TopicKey: "test/upsert-tier",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation upsert: %v", err)
+	}
+
+	obsL0After, _ := s.GetObservation(id, "L0")
+	if len(obsL0After.Content) > 510 {
+		t.Fatalf("L0 after upsert should be truncated, got %d chars", len(obsL0After.Content))
 	}
 }

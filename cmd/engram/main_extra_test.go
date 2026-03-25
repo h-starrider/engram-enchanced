@@ -125,7 +125,7 @@ func stubRuntimeHooks(t *testing.T) {
 		return s.Timeline(observationID, before, after)
 	}
 	storeFormatContext = func(s *store.Store, project, scope string) (string, error) {
-		return s.FormatContext(project, scope)
+		return s.FormatContext(project, scope, "")
 	}
 	storeStats = func(s *store.Store) (*store.Stats, error) { return s.Stats() }
 	storeExport = func(s *store.Store) (*store.ExportData, error) { return s.Export() }

@@ -184,6 +184,9 @@ func registerTools(srv *server.MCPServer, s *store.Store, allowlist map[string]b
 				mcp.WithNumber("limit",
 					mcp.Description("Max results (default: 10, max: 20)"),
 				),
+				mcp.WithString("detail",
+					mcp.Description("Content detail level: L0 (abstract ~500 chars), L1 (overview ~8000 chars), L2 (full, default)"),
+				),
 			),
 			handleSearch(s),
 		)
@@ -380,6 +383,9 @@ Examples:
 				mcp.WithNumber("limit",
 					mcp.Description("Number of observations to retrieve (default: 20)"),
 				),
+				mcp.WithString("detail",
+					mcp.Description("Content detail level: L0 (abstract ~500 chars), L1 (overview ~8000 chars), L2 (full, default)"),
+				),
 			),
 			handleContext(s),
 		)
@@ -440,6 +446,9 @@ Examples:
 				mcp.WithNumber("id",
 					mcp.Required(),
 					mcp.Description("The observation ID to retrieve"),
+				),
+				mcp.WithString("detail",
+					mcp.Description("Content detail level: L0 (abstract ~500 chars), L1 (overview ~8000 chars), L2 (full, default)"),
 				),
 			),
 			handleGetObservation(s),
@@ -591,6 +600,7 @@ func handleSearch(s *store.Store) server.ToolHandlerFunc {
 		typ, _ := req.GetArguments()["type"].(string)
 		project, _ := req.GetArguments()["project"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
+		detail, _ := req.GetArguments()["detail"].(string)
 		limit := intArg(req, "limit", 10)
 
 		results, err := s.Search(query, store.SearchOptions{
@@ -598,6 +608,7 @@ func handleSearch(s *store.Store) server.ToolHandlerFunc {
 			Project: project,
 			Scope:   scope,
 			Limit:   limit,
+			Tier:    detail,
 		})
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", err)), nil
@@ -798,8 +809,9 @@ func handleContext(s *store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		project, _ := req.GetArguments()["project"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
+		detail, _ := req.GetArguments()["detail"].(string)
 
-		context, err := s.FormatContext(project, scope)
+		context, err := s.FormatContext(project, scope, detail)
 		if err != nil {
 			return mcp.NewToolResultError("Failed to get context: " + err.Error()), nil
 		}
@@ -899,11 +911,12 @@ func handleTimeline(s *store.Store) server.ToolHandlerFunc {
 func handleGetObservation(s *store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id := int64(intArg(req, "id", 0))
+		detail, _ := req.GetArguments()["detail"].(string)
 		if id == 0 {
 			return mcp.NewToolResultError("id is required"), nil
 		}
 
-		obs, err := s.GetObservation(id)
+		obs, err := s.GetObservation(id, detail)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Observation #%d not found", id)), nil
 		}

@@ -107,6 +107,7 @@ type SearchOptions struct {
 	Project string `json:"project,omitempty"`
 	Scope   string `json:"scope,omitempty"`
 	Limit   int    `json:"limit,omitempty"`
+	Tier    string `json:"tier,omitempty"`
 }
 
 type AddObservationParams struct {
@@ -554,6 +555,8 @@ func (s *Store) migrate() error {
 		{name: "last_seen_at", definition: "TEXT"},
 		{name: "updated_at", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "deleted_at", definition: "TEXT"},
+		{name: "abstract", definition: "TEXT"},
+		{name: "overview", definition: "TEXT"},
 	}
 	for _, c := range observationColumns {
 		if err := s.addColumnIfNotExists("observations", c.name, c.definition); err != nil {
@@ -943,14 +946,13 @@ func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation,
 		limit = 200
 	}
 
-	query := `
-		SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		       scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+	query := fmt.Sprintf(`
+		SELECT %s
 		FROM observations
 		WHERE session_id = ? AND deleted_at IS NULL
 		ORDER BY created_at ASC
 		LIMIT ?
-	`
+	`, obsColumns("", ""))
 	return s.queryObservations(query, sessionID, limit)
 }
 
@@ -967,6 +969,8 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	scope := normalizeScope(p.Scope)
 	normHash := hashNormalized(content)
 	topicKey := normalizeTopicKey(p.TopicKey)
+	abstract := smartTruncate(content, 500)
+	overview := smartTruncate(content, 8000)
 
 	var observationID int64
 	err := s.withTx(func(tx *sql.Tx) error {
@@ -989,6 +993,8 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 					 SET type = ?,
 					     title = ?,
 					     content = ?,
+					     abstract = ?,
+					     overview = ?,
 					     tool_name = ?,
 					     topic_key = ?,
 					     normalized_hash = ?,
@@ -999,6 +1005,8 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 					p.Type,
 					title,
 					content,
+					abstract,
+					overview,
 					nullableString(p.ToolName),
 					nullableString(topicKey),
 					normHash,
@@ -1057,9 +1065,9 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 
 		syncID := newSyncID("obs")
 		res, err := s.execHook(tx,
-			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'))`,
-			syncID, p.SessionID, p.Type, title, content,
+			`INSERT INTO observations (sync_id, session_id, type, title, content, abstract, overview, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'))`,
+			syncID, p.SessionID, p.Type, title, content, abstract, overview,
 			nullableString(p.ToolName), nullableString(p.Project), scope, nullableString(topicKey), normHash,
 		)
 		if err != nil {
@@ -1081,17 +1089,20 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	return observationID, nil
 }
 
-func (s *Store) RecentObservations(project, scope string, limit int) ([]Observation, error) {
+func (s *Store) RecentObservations(project, scope string, limit int, tier ...string) ([]Observation, error) {
 	if limit <= 0 {
 		limit = s.cfg.MaxContextResults
 	}
+	t := ""
+	if len(tier) > 0 {
+		t = tier[0]
+	}
 
-	query := `
-		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at
+	query := fmt.Sprintf(`
+		SELECT %s
 		FROM observations o
 		WHERE o.deleted_at IS NULL
-	`
+	`, obsColumns("o", t))
 	args := []any{}
 
 	if project != "" {
@@ -1219,11 +1230,13 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 
 // ─── Get Single Observation ──────────────────────────────────────────────────
 
-func (s *Store) GetObservation(id int64) (*Observation, error) {
+func (s *Store) GetObservation(id int64, tier ...string) (*Observation, error) {
+	t := ""
+	if len(tier) > 0 {
+		t = tier[0]
+	}
 	row := s.db.QueryRow(
-		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
-		 FROM observations WHERE id = ? AND deleted_at IS NULL`, id,
+		fmt.Sprintf(`SELECT %s FROM observations WHERE id = ? AND deleted_at IS NULL`, obsColumns("", t)), id,
 	)
 	var o Observation
 	if err := row.Scan(
@@ -1469,12 +1482,11 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 
 	var directResults []SearchResult
 	if strings.Contains(query, "/") {
-		tkSQL := `
-			SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-			       scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		tkSQL := fmt.Sprintf(`
+			SELECT %s
 			FROM observations
 			WHERE topic_key = ? AND deleted_at IS NULL
-		`
+		`, obsColumns("", opts.Tier))
 		tkArgs := []any{query}
 
 		if opts.Type != "" {
@@ -1514,9 +1526,8 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	// Sanitize query for FTS5 — wrap each term in quotes to avoid syntax errors
 	ftsQuery := sanitizeFTS(query)
 
-	sqlQ := `
-		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at,
+	sqlQ := fmt.Sprintf(`
+		SELECT %s,`, obsColumns("o", opts.Tier)) + `
 		       fts.rank
 		FROM observations_fts fts
 		JOIN observations o ON o.id = fts.rowid
@@ -1606,13 +1617,13 @@ func (s *Store) Stats() (*Stats, error) {
 
 // ─── Context Formatting ─────────────────────────────────────────────────────
 
-func (s *Store) FormatContext(project, scope string) (string, error) {
+func (s *Store) FormatContext(project, scope, tier string) (string, error) {
 	sessions, err := s.RecentSessions(project, 5)
 	if err != nil {
 		return "", err
 	}
 
-	observations, err := s.RecentObservations(project, scope, s.cfg.MaxContextResults)
+	observations, err := s.RecentObservations(project, scope, s.cfg.MaxContextResults, tier)
 	if err != nil {
 		return "", err
 	}
@@ -2772,6 +2783,8 @@ func (s *Store) migrateLegacyObservationsTable() error {
 			type       TEXT    NOT NULL,
 			title      TEXT    NOT NULL,
 			content    TEXT    NOT NULL,
+			abstract   TEXT,
+			overview   TEXT,
 			tool_name  TEXT,
 			project    TEXT,
 			scope      TEXT    NOT NULL DEFAULT 'project',
@@ -3078,6 +3091,69 @@ func sanitizeFTS(query string) string {
 		words[i] = `"` + w + `"`
 	}
 	return strings.Join(words, " ")
+}
+
+// ─── Tiered Content ──────────────────────────────────────────────────────────
+
+// smartTruncate truncates text at the last sentence boundary before maxLen.
+// Falls back to word boundary, then hard cut. Appends "..." if truncated.
+func smartTruncate(text string, maxLen int) string {
+	if len(text) <= maxLen {
+		return text
+	}
+	region := text[:maxLen]
+
+	// Try sentence boundary: last .!? followed by space/newline, or \n anywhere
+	best := -1
+	for i := len(region) - 1; i >= 0; i-- {
+		ch := region[i]
+		if ch == '\n' {
+			best = i + 1
+			break
+		}
+		if (ch == '.' || ch == '!' || ch == '?') &&
+			(i == len(region)-1 || region[i+1] == ' ' || region[i+1] == '\n') {
+			best = i + 1
+			break
+		}
+	}
+	if best > 0 {
+		return strings.TrimSpace(region[:best]) + "..."
+	}
+
+	// Fallback: word boundary (last space)
+	if idx := strings.LastIndex(region, " "); idx > 0 {
+		return region[:idx] + "..."
+	}
+
+	// Hard cut
+	return region + "..."
+}
+
+// contentExpr returns the SQL expression for the content column based on tier.
+// prefix is the table alias (e.g. "o.") or "" for unaliased queries.
+func contentExpr(prefix, tier string) string {
+	switch strings.ToUpper(strings.TrimSpace(tier)) {
+	case "L0":
+		return fmt.Sprintf("COALESCE(%sabstract, SUBSTR(%scontent, 1, 500)) as content", prefix, prefix)
+	case "L1":
+		return fmt.Sprintf("COALESCE(%soverview, SUBSTR(%scontent, 1, 8000)) as content", prefix, prefix)
+	default:
+		return prefix + "content"
+	}
+}
+
+// obsColumns returns the 16-column SELECT list for observations with content
+// swapped based on tier. alias is the table alias (e.g. "o") or "" for none.
+func obsColumns(alias, tier string) string {
+	prefix := ""
+	if alias != "" {
+		prefix = alias + "."
+	}
+	return fmt.Sprintf(
+		"%[1]sid, ifnull(%[1]ssync_id, '') as sync_id, %[1]ssession_id, %[1]stype, %[1]stitle, %[2]s, %[1]stool_name, %[1]sproject, %[1]sscope, %[1]stopic_key, %[1]srevision_count, %[1]sduplicate_count, %[1]slast_seen_at, %[1]screated_at, %[1]supdated_at, %[1]sdeleted_at",
+		prefix, contentExpr(prefix, tier),
+	)
 }
 
 // ─── Passive Capture ─────────────────────────────────────────────────────────

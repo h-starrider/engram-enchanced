@@ -1573,6 +1573,113 @@ func TestHandleSessionSummaryAndEndSessionDedup(t *testing.T) {
 	}
 }
 
+func TestHandleSearchWithDetailL0(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSearch(s)
+
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Create observation with long content
+	var longContent strings.Builder
+	for longContent.Len() < 5000 {
+		longContent.WriteString("This is a test sentence with enough words to be meaningful. ")
+	}
+	_, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s1", Type: "manual", Title: "Tiered search test",
+		Content: longContent.String()[:5000], Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "tiered search test",
+		"project": "engram",
+		"detail":  "L0",
+	}}}
+	res, err := h(context.Background(), req)
+	if err != nil || res.IsError {
+		t.Fatalf("search L0: err=%v isError=%v", err, res.IsError)
+	}
+
+	text := callResultText(t, res)
+	if !strings.Contains(text, "Found 1 memories") {
+		t.Fatalf("expected 1 result, got: %s", text)
+	}
+}
+
+func TestHandleGetObservationWithDetailL1(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleGetObservation(s)
+
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	var longContent strings.Builder
+	for longContent.Len() < 10000 {
+		longContent.WriteString("This is a sentence that will be used to generate long content for testing. ")
+	}
+	id, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s1", Type: "manual", Title: "Tiered get test",
+		Content: longContent.String()[:10000], Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"id":     float64(id),
+		"detail": "L1",
+	}}}
+	res, err := h(context.Background(), req)
+	if err != nil || res.IsError {
+		t.Fatalf("get obs L1: err=%v isError=%v", err, res.IsError)
+	}
+
+	text := callResultText(t, res)
+	// L1 should return overview (~8000 chars), not full 10000
+	if len(text) > 9000 {
+		t.Fatalf("L1 response should be shorter than full content, got %d chars", len(text))
+	}
+}
+
+func TestHandleSearchWithoutDetailBackwardCompat(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSearch(s)
+
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	_, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s1", Type: "manual", Title: "Compat test observation",
+		Content: "Short content that fits in any tier.", Project: "engram",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "compat test",
+		"project": "engram",
+	}}}
+	res, err := h(context.Background(), req)
+	if err != nil || res.IsError {
+		t.Fatalf("search no detail: err=%v isError=%v", err, res.IsError)
+	}
+
+	text := callResultText(t, res)
+	if !strings.Contains(text, "Found 1 memories") {
+		t.Fatalf("expected 1 result, got: %s", text)
+	}
+	if !strings.Contains(text, "Short content") {
+		t.Fatalf("expected full content in result, got: %s", text)
+	}
+}
+
 func TestDestructiveToolAnnotation(t *testing.T) {
 	s := newMCPTestStore(t)
 	srv := NewServer(s)
