@@ -16,6 +16,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/Gentleman-Programming/engram/internal/store"
@@ -958,7 +959,22 @@ func handleSessionSummary(s *store.Store) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("Failed to save session summary: " + err.Error()), nil
 		}
 
-		return mcp.NewToolResultText(fmt.Sprintf("Session summary saved for project %q", project)), nil
+		// Auto-extract learnings from summary
+		pcResult, pcErr := s.PassiveCapture(store.PassiveCaptureParams{
+			SessionID: sessionID,
+			Content:   content,
+			Project:   project,
+			Source:    "session-summary-auto",
+		})
+		if pcErr != nil {
+			log.Printf("[engram] passive capture in session summary failed: %v", pcErr)
+		}
+
+		msg := fmt.Sprintf("Session summary saved for project %q", project)
+		if pcResult != nil && pcResult.Saved > 0 {
+			msg += fmt.Sprintf(" (auto-extracted %d learnings)", pcResult.Saved)
+		}
+		return mcp.NewToolResultText(msg), nil
 	}
 }
 

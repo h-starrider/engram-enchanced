@@ -4005,3 +4005,176 @@ func TestMigrateProjectIdempotent(t *testing.T) {
 		t.Fatal("second migration should be a no-op")
 	}
 }
+
+// ─── Auto-Extract Learnings Tests ────────────────────────────────────────────
+
+func TestExtractLearningsDiscoveriesHeader(t *testing.T) {
+	text := `## Goal
+Build the auth module.
+
+## Discoveries
+- The bcrypt cost=12 is the right balance for our server performance
+- JWT refresh tokens need atomic rotation to prevent race conditions
+- Always validate the audience claim in JWT tokens before trusting them
+
+## Accomplished
+- Finished auth module
+`
+	learnings := ExtractLearnings(text)
+	if len(learnings) != 3 {
+		t.Fatalf("expected 3 learnings from ## Discoveries, got %d: %v", len(learnings), learnings)
+	}
+	if !strings.Contains(learnings[0], "bcrypt") {
+		t.Fatalf("expected first learning about bcrypt, got %q", learnings[0])
+	}
+}
+
+func TestExtractLearningsDiscoveriesNumbered(t *testing.T) {
+	text := `## Discoveries
+
+1. The bcrypt cost=12 is the right balance for our server performance
+2. JWT refresh tokens need atomic rotation to prevent race conditions
+`
+	learnings := ExtractLearnings(text)
+	if len(learnings) != 2 {
+		t.Fatalf("expected 2 numbered learnings from ## Discoveries, got %d: %v", len(learnings), learnings)
+	}
+}
+
+func TestExtractLearningsDescubrimientos(t *testing.T) {
+	text := `## Descubrimientos
+
+1. El costo de bcrypt=12 es el balance correcto para nuestro servidor
+2. Los refresh tokens de JWT necesitan rotacion atomica para evitar race conditions
+3. Siempre validar el claim audience en los tokens JWT antes de confiar en ellos
+`
+	learnings := ExtractLearnings(text)
+	if len(learnings) != 3 {
+		t.Fatalf("expected 3 learnings from ## Descubrimientos, got %d: %v", len(learnings), learnings)
+	}
+}
+
+func TestExtractLearningsKeyLearningsStillWorks(t *testing.T) {
+	text := `## Key Learnings:
+
+- The bcrypt cost=12 is the right balance for our server performance
+- JWT refresh tokens need atomic rotation to prevent race conditions
+`
+	learnings := ExtractLearnings(text)
+	if len(learnings) != 2 {
+		t.Fatalf("expected 2 learnings from ## Key Learnings: (backward compat), got %d: %v", len(learnings), learnings)
+	}
+}
+
+func TestExtractLearningsNoMatchingHeader(t *testing.T) {
+	text := `## Summary
+This is just a regular summary with no learning headers.
+
+## Next Steps
+- Do something else
+`
+	learnings := ExtractLearnings(text)
+	if learnings != nil {
+		t.Fatalf("expected nil for no matching headers, got %d: %v", len(learnings), learnings)
+	}
+}
+
+func TestExtractLearningsDiscoveriesShortItemsFiltered(t *testing.T) {
+	text := `## Discoveries
+- too short
+- also tiny
+- The bcrypt cost=12 is the right balance for our server performance
+- nope
+`
+	learnings := ExtractLearnings(text)
+	if len(learnings) != 1 {
+		t.Fatalf("expected 1 learning (short ones filtered), got %d: %v", len(learnings), learnings)
+	}
+	if !strings.Contains(learnings[0], "bcrypt") {
+		t.Fatalf("expected the bcrypt learning, got %q", learnings[0])
+	}
+}
+
+func TestEndSessionAutoExtractsLearnings(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s-auto", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	summary := `## Goal
+Build the auth module.
+
+## Discoveries
+- The bcrypt cost=12 is the right balance for our server performance
+- JWT refresh tokens need atomic rotation to prevent race conditions
+- Always validate the audience claim in JWT tokens before trusting them
+
+## Accomplished
+- Finished auth module
+`
+	if err := s.EndSession("s-auto", summary); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+
+	obs, err := s.RecentObservations("engram", "project", 10)
+	if err != nil {
+		t.Fatalf("RecentObservations: %v", err)
+	}
+
+	passiveCount := 0
+	for _, o := range obs {
+		if o.Type == "passive" {
+			passiveCount++
+		}
+	}
+	if passiveCount != 3 {
+		t.Fatalf("expected 3 passive observations from auto-extraction, got %d", passiveCount)
+	}
+}
+
+func TestEndSessionEmptySummarySkipsExtraction(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s-empty", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	if err := s.EndSession("s-empty", ""); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+
+	obs, err := s.RecentObservations("engram", "project", 10)
+	if err != nil {
+		t.Fatalf("RecentObservations: %v", err)
+	}
+
+	for _, o := range obs {
+		if o.Type == "passive" {
+			t.Fatalf("expected zero passive observations for empty summary, found one: %q", o.Title)
+		}
+	}
+}
+
+func TestEndSessionNoHeadersSkipsSilently(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s-plain", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	if err := s.EndSession("s-plain", "Just a plain text summary with no headers at all."); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+
+	obs, err := s.RecentObservations("engram", "project", 10)
+	if err != nil {
+		t.Fatalf("RecentObservations: %v", err)
+	}
+
+	for _, o := range obs {
+		if o.Type == "passive" {
+			t.Fatalf("expected zero passive observations for plain text summary, found one: %q", o.Title)
+		}
+	}
+}

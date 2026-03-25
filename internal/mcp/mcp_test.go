@@ -1487,6 +1487,92 @@ func TestExplicitSessionIDBypassesDefault(t *testing.T) {
 	}
 }
 
+func TestHandleSessionSummaryAutoExtractsLearnings(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSessionSummary(s)
+
+	content := "## Goal\nBuild auth module.\n\n## Discoveries\n- The bcrypt cost=12 is the right balance for our server performance\n- JWT refresh tokens need atomic rotation to prevent race conditions\n\n## Accomplished\n- Finished auth module\n"
+
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"content": content,
+		"project": "engram",
+	}}}
+	res, err := h(context.Background(), req)
+	if err != nil {
+		t.Fatalf("session summary handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res))
+	}
+
+	text := callResultText(t, res)
+	if !strings.Contains(text, "auto-extracted 2 learnings") {
+		t.Fatalf("expected auto-extracted learnings in response, got: %s", text)
+	}
+
+	obs, err := s.RecentObservations("engram", "project", 10)
+	if err != nil {
+		t.Fatalf("RecentObservations: %v", err)
+	}
+
+	var summaryCount, passiveCount int
+	for _, o := range obs {
+		switch o.Type {
+		case "session_summary":
+			summaryCount++
+		case "passive":
+			passiveCount++
+		}
+	}
+	if summaryCount != 1 {
+		t.Fatalf("expected 1 session_summary, got %d", summaryCount)
+	}
+	if passiveCount != 2 {
+		t.Fatalf("expected 2 passive observations, got %d", passiveCount)
+	}
+}
+
+func TestHandleSessionSummaryAndEndSessionDedup(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSessionSummary(s)
+
+	content := "## Goal\nBuild auth.\n\n## Discoveries\n- The bcrypt cost=12 is the right balance for our server performance\n- JWT refresh tokens need atomic rotation to prevent race conditions\n"
+
+	// First: call session summary (MCP path)
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"content":    content,
+		"project":    "engram",
+		"session_id": "s-dedup",
+	}}}
+	if err := s.CreateSession("s-dedup", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	res, err := h(context.Background(), req)
+	if err != nil || res.IsError {
+		t.Fatalf("session summary: err=%v isError=%v", err, res.IsError)
+	}
+
+	// Second: call EndSession with same content (store path)
+	if err := s.EndSession("s-dedup", content); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+
+	obs, err := s.RecentObservations("engram", "project", 20)
+	if err != nil {
+		t.Fatalf("RecentObservations: %v", err)
+	}
+
+	passiveCount := 0
+	for _, o := range obs {
+		if o.Type == "passive" {
+			passiveCount++
+		}
+	}
+	if passiveCount != 2 {
+		t.Fatalf("expected 2 passive observations (dedup should prevent doubles), got %d", passiveCount)
+	}
+}
+
 func TestDestructiveToolAnnotation(t *testing.T) {
 	s := newMCPTestStore(t)
 	srv := NewServer(s)

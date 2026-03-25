@@ -765,7 +765,7 @@ func (s *Store) CreateSession(id, project, directory string) error {
 }
 
 func (s *Store) EndSession(id string, summary string) error {
-	return s.withTx(func(tx *sql.Tx) error {
+	err := s.withTx(func(tx *sql.Tx) error {
 		res, err := s.execHook(tx,
 			`UPDATE sessions SET ended_at = datetime('now'), summary = ? WHERE id = ?`,
 			nullableString(summary), id,
@@ -799,6 +799,23 @@ func (s *Store) EndSession(id string, summary string) error {
 			Summary:   storedSummary,
 		})
 	})
+	if err != nil {
+		return err
+	}
+
+	// Auto-extract learnings from summary (best-effort, outside tx)
+	if summary != "" {
+		if sess, err := s.GetSession(id); err == nil && sess != nil {
+			s.PassiveCapture(PassiveCaptureParams{
+				SessionID: id,
+				Content:   summary,
+				Project:   sess.Project,
+				Source:    "session-end-auto",
+			})
+		}
+	}
+
+	return nil
 }
 
 func (s *Store) GetSession(id string) (*Session, error) {
@@ -3081,8 +3098,10 @@ type PassiveCaptureResult struct {
 }
 
 // learningHeaderPattern matches section headers for learnings in both English and Spanish.
+// Supported headers: ## Key Learnings, ## Learnings, ## Discoveries,
+// ## Aprendizajes Clave, ## Aprendizajes, ## Descubrimientos (and ### variants).
 var learningHeaderPattern = regexp.MustCompile(
-	`(?im)^#{2,3}\s+(?:Aprendizajes(?:\s+Clave)?|Key\s+Learnings?|Learnings?):?\s*$`,
+	`(?im)^#{2,3}\s+(?:Aprendizajes(?:\s+Clave)?|Key\s+Learnings?|Learnings?|Discoveries|Descubrimientos):?\s*$`,
 )
 
 const (
@@ -3091,8 +3110,9 @@ const (
 )
 
 // ExtractLearnings parses structured learning items from text.
-// It looks for sections like "## Key Learnings:" or "## Aprendizajes Clave:"
-// and extracts numbered (1. text) or bullet (- text) items.
+// It looks for sections like "## Key Learnings:", "## Discoveries",
+// "## Aprendizajes Clave:", or "## Descubrimientos" and extracts
+// numbered (1. text) or bullet (- text) items.
 // Returns learnings from the LAST matching section (most recent output).
 func ExtractLearnings(text string) []string {
 	matches := learningHeaderPattern.FindAllStringIndex(text, -1)
