@@ -4429,3 +4429,111 @@ func TestUpsertRegeneratesTiers(t *testing.T) {
 		t.Fatalf("L0 after upsert should be truncated, got %d chars", len(obsL0After.Content))
 	}
 }
+
+// ─── File Ingestion Tests ────────────────────────────────────────────────────
+
+func TestIngestFileCreatesObservations(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Write a temp .txt file with multiple paragraphs
+	content := "First paragraph with enough text to be meaningful and searchable.\n\nSecond paragraph has different content for the search index.\n\nThird paragraph rounds out the document nicely."
+	tmpFile := filepath.Join(t.TempDir(), "test-ingest.txt")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	result, err := s.IngestFile(IngestFileParams{
+		FilePath:  tmpFile,
+		SessionID: "s1",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("IngestFile: %v", err)
+	}
+
+	if result.Format != "txt" {
+		t.Fatalf("expected format 'txt', got %q", result.Format)
+	}
+	if result.Chunks == 0 {
+		t.Fatal("expected at least 1 chunk")
+	}
+	if len(result.IDs) != result.Chunks {
+		t.Fatalf("IDs count %d != Chunks %d", len(result.IDs), result.Chunks)
+	}
+
+	// Verify observations exist with source metadata
+	obs, err := s.GetObservation(result.IDs[0])
+	if err != nil {
+		t.Fatalf("GetObservation: %v", err)
+	}
+	if obs.Type != "file_ingest" {
+		t.Fatalf("expected type 'file_ingest', got %q", obs.Type)
+	}
+	if obs.Content == "" {
+		t.Fatal("expected non-empty content")
+	}
+}
+
+func TestIngestFileChunkCap(t *testing.T) {
+	s := newTestStore(t)
+	s.cfg.MaxIngestChunks = 3 // low cap for testing
+
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Create a file with many paragraphs
+	var parts []string
+	for i := 0; i < 20; i++ {
+		parts = append(parts, strings.Repeat("Paragraph content here. ", 200))
+	}
+	content := strings.Join(parts, "\n\n")
+	tmpFile := filepath.Join(t.TempDir(), "test-cap.txt")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	result, err := s.IngestFile(IngestFileParams{
+		FilePath:  tmpFile,
+		SessionID: "s1",
+		Project:   "engram",
+	})
+	if err != nil {
+		t.Fatalf("IngestFile: %v", err)
+	}
+
+	if !result.Capped {
+		t.Fatal("expected capped=true")
+	}
+	if result.Chunks != 3 {
+		t.Fatalf("expected 3 chunks (capped), got %d", result.Chunks)
+	}
+	if result.Warning == "" {
+		t.Fatal("expected warning message")
+	}
+}
+
+func TestIngestFileUnsupportedFormat(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	tmpFile := filepath.Join(t.TempDir(), "test.bin")
+	if err := os.WriteFile(tmpFile, []byte("binary data"), 0644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	_, err := s.IngestFile(IngestFileParams{
+		FilePath:  tmpFile,
+		SessionID: "s1",
+		Project:   "engram",
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported format")
+	}
+}

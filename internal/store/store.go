@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/parser"
 	_ "modernc.org/sqlite"
 )
 
@@ -111,14 +112,32 @@ type SearchOptions struct {
 }
 
 type AddObservationParams struct {
-	SessionID string `json:"session_id"`
-	Type      string `json:"type"`
-	Title     string `json:"title"`
-	Content   string `json:"content"`
-	ToolName  string `json:"tool_name,omitempty"`
-	Project   string `json:"project,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	TopicKey  string `json:"topic_key,omitempty"`
+	SessionID    string `json:"session_id"`
+	Type         string `json:"type"`
+	Title        string `json:"title"`
+	Content      string `json:"content"`
+	ToolName     string `json:"tool_name,omitempty"`
+	Project      string `json:"project,omitempty"`
+	Scope        string `json:"scope,omitempty"`
+	TopicKey     string `json:"topic_key,omitempty"`
+	SourceFormat string `json:"source_format,omitempty"`
+	SourcePath   string `json:"source_path,omitempty"`
+	ChunkIndex   *int   `json:"chunk_index,omitempty"`
+}
+
+type IngestFileParams struct {
+	FilePath  string
+	SessionID string
+	Project   string
+	Scope     string
+}
+
+type IngestFileResult struct {
+	IDs     []int64 `json:"ids"`
+	Format  string  `json:"format"`
+	Chunks  int     `json:"chunks"`
+	Capped  bool    `json:"capped"`
+	Warning string  `json:"warning,omitempty"`
 }
 
 type UpdateObservationParams struct {
@@ -244,6 +263,7 @@ type Config struct {
 	MaxObservationLength int
 	MaxContextResults    int
 	MaxSearchResults     int
+	MaxIngestChunks      int
 	DedupeWindow         time.Duration
 }
 
@@ -257,6 +277,7 @@ func DefaultConfig() (Config, error) {
 		MaxObservationLength: 50000,
 		MaxContextResults:    20,
 		MaxSearchResults:     20,
+		MaxIngestChunks:      50,
 		DedupeWindow:         15 * time.Minute,
 	}, nil
 }
@@ -270,6 +291,7 @@ func FallbackConfig(dataDir string) Config {
 		MaxObservationLength: 50000,
 		MaxContextResults:    20,
 		MaxSearchResults:     20,
+		MaxIngestChunks:      50,
 		DedupeWindow:         15 * time.Minute,
 	}
 }
@@ -557,6 +579,9 @@ func (s *Store) migrate() error {
 		{name: "deleted_at", definition: "TEXT"},
 		{name: "abstract", definition: "TEXT"},
 		{name: "overview", definition: "TEXT"},
+		{name: "source_format", definition: "TEXT"},
+		{name: "source_path", definition: "TEXT"},
+		{name: "chunk_index", definition: "INTEGER"},
 	}
 	for _, c := range observationColumns {
 		if err := s.addColumnIfNotExists("observations", c.name, c.definition); err != nil {
@@ -1065,10 +1090,11 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 
 		syncID := newSyncID("obs")
 		res, err := s.execHook(tx,
-			`INSERT INTO observations (sync_id, session_id, type, title, content, abstract, overview, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'))`,
+			`INSERT INTO observations (sync_id, session_id, type, title, content, abstract, overview, tool_name, project, scope, topic_key, normalized_hash, source_format, source_path, chunk_index, revision_count, duplicate_count, last_seen_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'))`,
 			syncID, p.SessionID, p.Type, title, content, abstract, overview,
 			nullableString(p.ToolName), nullableString(p.Project), scope, nullableString(topicKey), normHash,
+			nullableString(p.SourceFormat), nullableString(p.SourcePath), nullableInt(p.ChunkIndex),
 		)
 		if err != nil {
 			return err
@@ -2796,6 +2822,9 @@ func (s *Store) migrateLegacyObservationsTable() error {
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,
+			source_format TEXT,
+			source_path TEXT,
+			chunk_index INTEGER,
 			FOREIGN KEY (session_id) REFERENCES sessions(id)
 		);
 	`); err != nil {
@@ -2879,6 +2908,13 @@ func nullableString(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+func nullableInt(v *int) any {
+	if v == nil {
+		return nil
+	}
+	return *v
 }
 
 func truncate(s string, max int) string {
@@ -3091,6 +3127,53 @@ func sanitizeFTS(query string) string {
 		words[i] = `"` + w + `"`
 	}
 	return strings.Join(words, " ")
+}
+
+// ─── File Ingestion ──────────────────────────────────────────────────────────
+
+// IngestFile parses a file and creates observations from its chunks.
+func (s *Store) IngestFile(p IngestFileParams) (*IngestFileResult, error) {
+	chunks, err := parser.Parse(p.FilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &IngestFileResult{}
+	if len(chunks) > 0 {
+		result.Format = chunks[0].Format
+	}
+
+	maxChunks := s.cfg.MaxIngestChunks
+	if maxChunks <= 0 {
+		maxChunks = 50
+	}
+	if len(chunks) > maxChunks {
+		result.Capped = true
+		result.Warning = fmt.Sprintf("file produced %d chunks, capped at %d", len(chunks), maxChunks)
+		chunks = chunks[:maxChunks]
+	}
+
+	for _, chunk := range chunks {
+		idx := chunk.ChunkIndex
+		id, err := s.AddObservation(AddObservationParams{
+			SessionID:    p.SessionID,
+			Type:         "file_ingest",
+			Title:        chunk.Title,
+			Content:      chunk.Content,
+			Project:      p.Project,
+			Scope:        p.Scope,
+			SourceFormat: chunk.Format,
+			SourcePath:   p.FilePath,
+			ChunkIndex:   &idx,
+		})
+		if err != nil {
+			return result, fmt.Errorf("ingest chunk %d: %w", chunk.ChunkIndex, err)
+		}
+		result.IDs = append(result.IDs, id)
+	}
+	result.Chunks = len(result.IDs)
+
+	return result, nil
 }
 
 // ─── Tiered Content ──────────────────────────────────────────────────────────

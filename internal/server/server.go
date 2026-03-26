@@ -11,6 +11,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -105,6 +107,7 @@ func (s *Server) routes() {
 	// Observations
 	s.mux.HandleFunc("POST /observations", s.handleAddObservation)
 	s.mux.HandleFunc("POST /observations/passive", s.handlePassiveCapture)
+	s.mux.HandleFunc("POST /observations/from-file", s.handleIngestFile)
 	s.mux.HandleFunc("GET /observations/recent", s.handleRecentObservations)
 	s.mux.HandleFunc("PATCH /observations/{id}", s.handleUpdateObservation)
 	s.mux.HandleFunc("DELETE /observations/{id}", s.handleDeleteObservation)
@@ -237,6 +240,57 @@ func (s *Server) handlePassiveCapture(w http.ResponseWriter, r *http.Request) {
 	result, err := s.store.PassiveCapture(body)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.notifyWrite()
+	jsonResponse(w, http.StatusOK, result)
+}
+
+func (s *Server) handleIngestFile(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(100 << 20); err != nil { // 100MB max
+		jsonError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+
+	sessionID := r.FormValue("session_id")
+	project := r.FormValue("project")
+	if sessionID == "" || project == "" {
+		jsonError(w, http.StatusBadRequest, "session_id and project are required")
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "file field is required: "+err.Error())
+		return
+	}
+	defer file.Close()
+
+	// Save to temp file preserving extension
+	ext := filepath.Ext(header.Filename)
+	tmp, err := os.CreateTemp("", "engram-ingest-*"+ext)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to create temp file: "+err.Error())
+		return
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
+	if _, err := io.Copy(tmp, file); err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to write temp file: "+err.Error())
+		return
+	}
+	tmp.Close()
+
+	result, err := s.store.IngestFile(store.IngestFileParams{
+		FilePath:  tmp.Name(),
+		SessionID: sessionID,
+		Project:   project,
+		Scope:     "project",
+	})
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "ingestion failed: "+err.Error())
 		return
 	}
 

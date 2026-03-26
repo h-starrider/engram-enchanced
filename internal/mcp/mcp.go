@@ -57,6 +57,7 @@ var ProfileAgent = map[string]bool{
 	"mem_capture_passive":   true, // extract learnings from text — referenced in Gemini/Codex protocol
 	"mem_save_prompt":       true, // save user prompts
 	"mem_update":            true, // update observation by ID — skills say "use mem_update when you have an exact ID to correct"
+	"mem_ingest_file":       true, // ingest files (PDF, DOCX, XLSX, code, text) into observations
 }
 
 // ProfileAdmin contains tools for TUI, dashboards, and manual curation
@@ -590,6 +591,37 @@ Duplicates are automatically detected and skipped — safe to call multiple time
 			handleCapturePassive(s),
 		)
 	}
+
+	// ─── mem_ingest_file (profile: agent, deferred) ──────────────────────
+	if shouldRegister("mem_ingest_file", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_ingest_file",
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Ingest File"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(true),
+				mcp.WithDescription(`Ingest a local file into memory as searchable observations. Supports PDF, DOCX, XLSX, code files (Go, Python, TS/JS, Rust), and text files (txt, md, log, csv).
+
+The file is parsed, chunked intelligently (per page for PDF, per sheet for XLSX, per function for code, per paragraph for text), and each chunk is saved as a separate observation. Chunks are searchable via mem_search.
+
+Large files are capped at 50 chunks with a warning.`),
+				mcp.WithString("file_path",
+					mcp.Required(),
+					mcp.Description("Absolute path to the file on the local filesystem"),
+				),
+				mcp.WithString("project",
+					mcp.Required(),
+					mcp.Description("Project name for the observations"),
+				),
+				mcp.WithString("session_id",
+					mcp.Description("Session ID (default: manual-save-{project})"),
+				),
+			),
+			handleIngestFile(s),
+		)
+	}
 }
 
 // ─── Tool Handlers ───────────────────────────────────────────────────────────
@@ -1052,6 +1084,43 @@ func handleCapturePassive(s *store.Store) server.ToolHandlerFunc {
 			"Passive capture complete: extracted=%d saved=%d duplicates=%d",
 			result.Extracted, result.Saved, result.Duplicates,
 		)), nil
+	}
+}
+
+func handleIngestFile(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		filePath, _ := req.GetArguments()["file_path"].(string)
+		project, _ := req.GetArguments()["project"].(string)
+		sessionID, _ := req.GetArguments()["session_id"].(string)
+
+		if filePath == "" {
+			return mcp.NewToolResultError("file_path is required"), nil
+		}
+		if project == "" {
+			return mcp.NewToolResultError("project is required"), nil
+		}
+		if sessionID == "" {
+			sessionID = defaultSessionID(project)
+		}
+
+		_ = s.CreateSession(sessionID, project, "")
+
+		result, err := s.IngestFile(store.IngestFileParams{
+			FilePath:  filePath,
+			SessionID: sessionID,
+			Project:   project,
+			Scope:     "project",
+		})
+		if err != nil {
+			return mcp.NewToolResultError("File ingestion failed: " + err.Error()), nil
+		}
+
+		msg := fmt.Sprintf("Ingested %s: format=%s, %d chunks created (IDs: %v)",
+			filePath, result.Format, result.Chunks, result.IDs)
+		if result.Capped {
+			msg += fmt.Sprintf("\n⚠ WARNING: %s", result.Warning)
+		}
+		return mcp.NewToolResultText(msg), nil
 	}
 }
 
