@@ -296,7 +296,7 @@ func TestPassiveCaptureEndpointReturnsServerErrorWhenSessionMissing(t *testing.T
 	}
 }
 
-func TestDeleteSessionBlockedForCloudEnrolledProjectE2E(t *testing.T) {
+func TestDeleteSessionPropagatesForCloudEnrolledProjectE2E(t *testing.T) {
 	s, ts := newE2EServer(t)
 	client := ts.Client()
 
@@ -322,17 +322,24 @@ func TestDeleteSessionBlockedForCloudEnrolledProjectE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("delete session: %v", err)
 	}
-	if deleteResp.StatusCode != http.StatusConflict {
-		t.Fatalf("expected 409 deleting cloud-enrolled session, got %d", deleteResp.StatusCode)
-	}
-	bodyBytes, err := io.ReadAll(deleteResp.Body)
-	if err != nil {
-		t.Fatalf("read delete response body: %v", err)
+	if deleteResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 deleting cloud-enrolled session, got %d", deleteResp.StatusCode)
 	}
 	_ = deleteResp.Body.Close()
-	body := string(bodyBytes)
-	if !strings.Contains(body, "blocked") || !strings.Contains(body, "cloud") {
-		t.Fatalf("expected blocked-by-cloud delete error, got %q", body)
+
+	mutations, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 10)
+	if err != nil {
+		t.Fatalf("list pending sync mutations: %v", err)
+	}
+	var foundDelete bool
+	for _, mutation := range mutations {
+		if mutation.Entity == store.SyncEntitySession && mutation.EntityKey == "s-cloud-enrolled" && mutation.Op == store.SyncOpDelete {
+			foundDelete = true
+			break
+		}
+	}
+	if !foundDelete {
+		t.Fatalf("expected pending session/delete mutation for cloud-enrolled session, got %+v", mutations)
 	}
 }
 
