@@ -32,6 +32,21 @@ import (
 // JW6: DefaultProject removed — it was populated but never read (dead code).
 // Project is always auto-detected from cwd at call time via resolveWriteProject/resolveReadProject.
 type MCPConfig struct {
+	// BM25Floor overrides the default BM25 score floor used by FindCandidates
+	// during conflict candidate detection (REQ-001). The floor is the minimum
+	// acceptable BM25 rank (negative; closer to 0 = better match). Candidates
+	// whose score falls below this threshold are excluded.
+	//
+	// nil means "use the store default" (-2.0). An explicit pointer value
+	// (including 0.0) is forwarded directly. Using a pointer avoids the
+	// zero-value ambiguity where 0.0 would otherwise be indistinguishable
+	// from "not set".
+	BM25Floor *float64
+
+	// Limit overrides the maximum number of conflict candidates returned per
+	// mem_save call (REQ-001). nil means "use the store default" (3).
+	// An explicit pointer value (including 0) is forwarded directly.
+	Limit *int
 }
 
 var suggestTopicKey = store.SuggestTopicKey
@@ -68,6 +83,7 @@ var ProfileAgent = map[string]bool{
 	"mem_save_prompt":       true, // save user prompts
 	"mem_update":            true, // update observation by ID — skills say "use mem_update when you have an exact ID to correct"
 	"mem_current_project":   true, // detect current project — recommended first call for agents (REQ-313)
+	"mem_judge":             true, // record verdict on a pending memory conflict (REQ-003, Phase D)
 }
 
 // ProfileAdmin contains tools for TUI, dashboards, and manual curation
@@ -142,7 +158,38 @@ DEFERRED TOOLS (use ToolSearch when needed):
   mem_update, mem_suggest_topic_key, mem_session_start, mem_session_end,
   mem_stats, mem_delete, mem_timeline, mem_capture_passive, mem_merge_projects
 
-PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.`
+PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.
+
+## CONFLICT SURFACING — when mem_save returns candidates
+
+After every mem_save call, check the response envelope for judgment_required.
+
+IF judgment_required IS TRUE:
+  Iterate candidates[] and call mem_judge once per candidate using the
+  judgment_id from that candidate entry. Do NOT use the top-level judgment_id
+  for multiple candidates — each candidate has its own.
+
+  HEURISTIC — when to ask the user vs. resolve autonomously:
+
+  ASK the user (conversationally, as part of your next reply) when:
+    - confidence is below 0.7, OR
+    - the relation you would choose is supersedes or conflicts_with AND the
+      observation type is architecture, policy, or decision
+
+  RESOLVE silently (call mem_judge without asking) when:
+    - confidence >= 0.7 AND the relation is not supersedes/conflicts_with, OR
+    - the relation is related, compatible, scoped, or not_conflict
+
+  HOW TO ASK (conversationally — never via blocking CLI or dashboard prompt):
+    Raise it naturally in your next reply to the user. Example phrasing:
+    "I noticed memory #abc123 might conflict with what we just saved.
+     Want me to mark the new one as superseding it, or are they about
+     different scopes? I can also mark them as compatible if both still apply."
+
+  AFTER RESOLUTION (both paths):
+    Call mem_judge with the chosen relation, a reason, and if the user gave
+    explicit direction, include their words as the evidence field. This persists
+    the verdict and closes the pending conflict row.`
 
 // NewServerWithTools creates an MCP server registering only the tools in
 // the allowlist. If allowlist is nil, all tools are registered.
@@ -629,6 +676,60 @@ Duplicates are automatically detected and skipped — safe to call multiple time
 			handleCurrentProject(s),
 		)
 	}
+
+	// ─── mem_judge (profile: agent, eager) — REQ-003, Design §6 ─────────
+	if shouldRegister("mem_judge", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_judge",
+				mcp.WithDescription(`Record a verdict on a pending memory conflict surfaced by mem_save.
+
+WHEN TO CALL: After mem_save returns judgment_required=true, iterate candidates[] and call mem_judge once per entry using that entry's judgment_id.
+
+PARAMS:
+  judgment_id (required) — from candidates[].judgment_id in the mem_save response
+  relation    (required) — one of: related, compatible, scoped, conflicts_with, supersedes, not_conflict
+  reason      (optional) — free-text explanation of the verdict
+  evidence    (optional) — JSON or text supporting the verdict
+  confidence  (optional) — float 0..1; default 1.0
+
+WHEN TO ASK USER:
+  - confidence < 0.7: surface to user before judging
+  - relation in {supersedes, conflicts_with} AND type in {architecture, policy, decision}: ask user
+  - otherwise: resolve silently
+
+SUCCESS: Returns the updated relation row with judgment_status="judged".
+ERROR: Returns IsError=true if judgment_id is unknown or relation verb is invalid. Row is NOT mutated on error.
+
+Re-judging an already-judged ID overwrites the verdict (deliberate revision).`),
+				mcp.WithTitleAnnotation("Judge Memory Conflict"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("judgment_id",
+					mcp.Required(),
+					mcp.Description("The judgment_id from candidates[] in the mem_save response (format: rel-<hex>)"),
+				),
+				mcp.WithString("relation",
+					mcp.Required(),
+					mcp.Description("Verdict: related | compatible | scoped | conflicts_with | supersedes | not_conflict"),
+				),
+				mcp.WithString("reason",
+					mcp.Description("Free-text explanation of the verdict"),
+				),
+				mcp.WithString("evidence",
+					mcp.Description("Supporting evidence (JSON or free text)"),
+				),
+				mcp.WithNumber("confidence",
+					mcp.Description("Confidence score 0.0..1.0 (default: 1.0)"),
+				),
+				mcp.WithString("session_id",
+					mcp.Description("Session ID for provenance (default: auto)"),
+				),
+			),
+			handleJudge(s, activity),
+		)
+	}
 }
 
 // ─── Tool Handlers ───────────────────────────────────────────────────────────
@@ -702,6 +803,21 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 			return respondWithProject(detRes, fmt.Sprintf("No memories found for: %q", query), nil), nil
 		}
 
+		// Batch-load relations for all results (REQ-002). Avoids N+1.
+		syncIDs := make([]string, 0, len(results))
+		for _, r := range results {
+			if r.SyncID != "" {
+				syncIDs = append(syncIDs, r.SyncID)
+			}
+		}
+		relationsMap := map[string]store.ObservationRelations{}
+		if len(syncIDs) > 0 {
+			if rm, relErr := s.GetRelationsForObservations(syncIDs); relErr == nil {
+				relationsMap = rm
+			}
+			// Errors from relation loading are swallowed — search must not fail.
+		}
+
 		var b strings.Builder
 		fmt.Fprintf(&b, "Found %d memories:\n\n", len(results))
 		anyTruncated := false
@@ -715,10 +831,31 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 				anyTruncated = true
 				preview += " [preview]"
 			}
-			fmt.Fprintf(&b, "[%d] #%d (%s) — %s\n    %s\n    %s%s | scope: %s\n\n",
+			fmt.Fprintf(&b, "[%d] #%d (%s) — %s\n    %s\n    %s%s | scope: %s\n",
 				i+1, r.ID, r.Type, r.Title,
 				preview,
 				r.CreatedAt, projectDisplay, r.Scope)
+
+			// Append relation annotations (REQ-002). Skip orphaned (filtered by store).
+			if rels, ok := relationsMap[r.SyncID]; ok {
+				for _, rel := range rels.AsSource {
+					switch rel.Relation {
+					case store.RelationSupersedes:
+						fmt.Fprintf(&b, "    supersedes: #%s\n", rel.TargetID)
+					case store.RelationPending:
+						fmt.Fprintf(&b, "    conflict: contested by #%s (pending)\n", rel.TargetID)
+					}
+				}
+				for _, rel := range rels.AsTarget {
+					switch rel.Relation {
+					case store.RelationSupersedes:
+						fmt.Fprintf(&b, "    superseded_by: #%s\n", rel.SourceID)
+					case store.RelationPending:
+						fmt.Fprintf(&b, "    conflict: contested by #%s (pending)\n", rel.SourceID)
+					}
+				}
+			}
+			b.WriteString("\n")
 		}
 		if anyTruncated {
 			fmt.Fprintf(&b, "---\nResults above are previews (300 chars). To read the full content of a specific memory, call mem_get_observation(id: <ID>).\n")
@@ -793,7 +930,7 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 
 		truncated := len(content) > s.MaxObservationLength()
 
-		_, err = s.AddObservation(store.AddObservationParams{
+		savedID, err := s.AddObservation(store.AddObservationParams{
 			SessionID: sessionID,
 			Type:      typ,
 			Title:     title,
@@ -821,9 +958,64 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		if similarWarning != "" {
 			msg += "\n" + similarWarning
 		}
+
+		// Post-transaction conflict candidate detection (REQ-001).
+		// Errors are logged and swallowed — detection failure never fails the save.
+		extra := map[string]any{}
+		// Build CandidateOptions, forwarding any MCPConfig overrides.
+		// nil fields mean "use store defaults"; explicit pointer values override.
+		candOpts := store.CandidateOptions{
+			Project:   project,
+			Scope:     scope,
+			BM25Floor: cfg.BM25Floor, // nil → store default (-2.0); explicit value overrides
+		}
+		if cfg.Limit != nil {
+			candOpts.Limit = *cfg.Limit
+		}
+		candidates, candErr := s.FindCandidates(savedID, candOpts)
+		if candErr != nil {
+			// Log only — do not fail the save.
+			fmt.Fprintf(os.Stderr, "engram: FindCandidates error (non-fatal): %v\n", candErr)
+		}
+
+		// Fetch the saved observation's sync_id for the envelope (REQ-001).
+		var savedSyncID string
+		if obs, obsErr := s.GetObservation(savedID); obsErr == nil {
+			savedSyncID = obs.SyncID
+			extra["id"] = savedID
+			extra["sync_id"] = savedSyncID
+		}
+
+		if len(candidates) > 0 {
+			extra["judgment_required"] = true
+			extra["judgment_status"] = "pending"
+			extra["judgment_id"] = candidates[0].JudgmentID // first candidate's rel sync_id (design convenience)
+
+			candList := make([]map[string]any, 0, len(candidates))
+			for _, c := range candidates {
+				entry := map[string]any{
+					"id":          c.ID,
+					"sync_id":     c.SyncID,
+					"title":       c.Title,
+					"type":        c.Type,
+					"score":       c.Score,
+					"judgment_id": c.JudgmentID,
+				}
+				if c.TopicKey != nil {
+					entry["topic_key"] = *c.TopicKey
+				}
+				candList = append(candList, entry)
+			}
+			extra["candidates"] = candList
+
+			msg += fmt.Sprintf("\nCONFLICT REVIEW PENDING — %d candidate(s); use mem_judge to record verdicts.", len(candidates))
+		} else {
+			extra["judgment_required"] = false
+		}
+
 		// Update detRes to reflect normalized project for envelope accuracy
 		detRes.Project = project
-		return respondWithProject(detRes, msg, nil), nil
+		return respondWithProject(detRes, msg, extra), nil
 	}
 }
 
@@ -1311,6 +1503,78 @@ func handleCapturePassive(s *store.Store, cfg MCPConfig, activity *SessionActivi
 			"Passive capture complete: extracted=%d saved=%d duplicates=%d",
 			result.Extracted, result.Saved, result.Duplicates,
 		), nil), nil
+	}
+}
+
+// handleJudge implements mem_judge. It validates params, calls JudgeRelation,
+// and returns the updated relation row as JSON.
+//
+// Tool description contract (Design §6.1):
+// "Record a verdict on a pending memory conflict surfaced by mem_save.
+// When mem_save returns judgment_required=true, call mem_judge once per
+// candidate (judgment_id is in candidates[]). Use to mark SUPERSEDES,
+// CONFLICTS_WITH, NOT_CONFLICT, RELATED, COMPATIBLE, or SCOPED.
+// Ask the user when ambiguous."
+func handleJudge(s *store.Store, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		judgmentID, _ := req.GetArguments()["judgment_id"].(string)
+		relation, _ := req.GetArguments()["relation"].(string)
+
+		if judgmentID == "" {
+			return mcp.NewToolResultError("judgment_id is required"), nil
+		}
+		if relation == "" {
+			return mcp.NewToolResultError("relation is required"), nil
+		}
+
+		// Collect optional fields.
+		var reason *string
+		if v, ok := req.GetArguments()["reason"].(string); ok && v != "" {
+			reason = &v
+		}
+		var evidence *string
+		if v, ok := req.GetArguments()["evidence"].(string); ok && v != "" {
+			evidence = &v
+		}
+		var confidence *float64
+		if v, ok := req.GetArguments()["confidence"].(float64); ok {
+			// Clamp to [0, 1] per design §6.3.
+			if v < 0 {
+				v = 0
+			}
+			if v > 1 {
+				v = 1
+			}
+			confidence = &v
+		}
+
+		// Session context for provenance.
+		sessionID, _ := req.GetArguments()["session_id"].(string)
+		// Actor defaults to "agent" kind for MCP tool calls.
+		markedByActor := "agent"
+		markedByKind := "agent"
+		markedByModel := "" // No model ID available at MCP layer without explicit param.
+
+		result, err := s.JudgeRelation(store.JudgeRelationParams{
+			JudgmentID:    judgmentID,
+			Relation:      relation,
+			Reason:        reason,
+			Evidence:      evidence,
+			Confidence:    confidence,
+			MarkedByActor: markedByActor,
+			MarkedByKind:  markedByKind,
+			MarkedByModel: markedByModel,
+			SessionID:     sessionID,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		envelope := map[string]any{
+			"relation": result,
+		}
+		out, _ := jsonMarshal(envelope)
+		return mcp.NewToolResultText(string(out)), nil
 	}
 }
 

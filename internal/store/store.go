@@ -178,7 +178,21 @@ const (
 
 	SyncSourceLocal  = "local"
 	SyncSourceRemote = "remote"
+
+	// Decay defaults — months added to now() to compute review_after on new inserts.
+	// expires_at is NULL for all types in Phase 1.
+	decayDecisionMonths   = 6
+	decayPolicyMonths     = 12
+	decayPreferenceMonths = 3
 )
+
+// decayReviewAfterMonths maps observation type → month offset for review_after.
+// Types absent from this map get review_after = NULL (Phase 1 behavior).
+var decayReviewAfterMonths = map[string]int{
+	"decision":   decayDecisionMonths,
+	"policy":     decayPolicyMonths,
+	"preference": decayPreferenceMonths,
+}
 
 type SyncState struct {
 	TargetKey           string  `json:"target_key"`
@@ -751,6 +765,66 @@ func (s *Store) migrate() error {
 	if err := s.migrateSyncChunksTable(); err != nil {
 		return err
 	}
+
+	// ── Phase: memory-conflict-surfacing — B.1 ──────────────────────────────
+	// Additive nullable columns on observations for conflict surfacing, decay,
+	// and embedding reservation.  All applied via addColumnIfNotExists so that
+	// running migrate() on a fresh DB (where CREATE TABLE already added these
+	// columns) is a no-op.
+	memConflictObsCols := []struct {
+		name       string
+		definition string
+	}{
+		{name: "review_after", definition: "TEXT"},
+		{name: "expires_at", definition: "TEXT"},
+		{name: "embedding", definition: "BLOB"},
+		{name: "embedding_model", definition: "TEXT"},
+		{name: "embedding_created_at", definition: "TEXT"},
+	}
+	for _, c := range memConflictObsCols {
+		if err := s.addColumnIfNotExists("observations", c.name, c.definition); err != nil {
+			return err
+		}
+	}
+
+	// ── Phase: memory-conflict-surfacing — B.2 ──────────────────────────────
+	// Create the memory_relations table (idempotent via IF NOT EXISTS).
+	// source_id / target_id are TEXT sync_id keys (cross-machine portable).
+	// NO UNIQUE on (source_id, target_id) — multi-actor disagreement allowed.
+	if _, err := s.execHook(s.db, `
+		CREATE TABLE IF NOT EXISTS memory_relations (
+			id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+			sync_id                   TEXT    NOT NULL UNIQUE,
+			source_id                 TEXT,
+			target_id                 TEXT,
+			relation                  TEXT    NOT NULL DEFAULT 'pending',
+			reason                    TEXT,
+			evidence                  TEXT,
+			confidence                REAL,
+			judgment_status           TEXT    NOT NULL DEFAULT 'pending',
+			marked_by_actor           TEXT,
+			marked_by_kind            TEXT,
+			marked_by_model           TEXT,
+			session_id                TEXT,
+			superseded_at             TEXT,
+			superseded_by_relation_id INTEGER REFERENCES memory_relations(id) ON DELETE SET NULL,
+			created_at                TEXT    NOT NULL DEFAULT (datetime('now')),
+			updated_at                TEXT    NOT NULL DEFAULT (datetime('now'))
+		);
+	`); err != nil {
+		return err
+	}
+
+	// ── Phase: memory-conflict-surfacing — B.3 ──────────────────────────────
+	// Indexes for memory_relations (all idempotent via IF NOT EXISTS).
+	if _, err := s.execHook(s.db, `
+		CREATE INDEX IF NOT EXISTS idx_memrel_source    ON memory_relations(source_id, judgment_status);
+		CREATE INDEX IF NOT EXISTS idx_memrel_target    ON memory_relations(target_id, judgment_status);
+		CREATE INDEX IF NOT EXISTS idx_memrel_supersede ON memory_relations(superseded_by_relation_id);
+	`); err != nil {
+		return err
+	}
+
 	if _, err := s.execHook(s.db, `
 		CREATE TABLE IF NOT EXISTS sync_enrolled_projects (
 			project     TEXT PRIMARY KEY,
@@ -1925,6 +1999,20 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 		if err != nil {
 			return err
 		}
+
+		// Populate review_after for types that have a configured decay offset.
+		// expires_at is intentionally NULL for all types in Phase 1.
+		// This UPDATE runs only for NEW inserts (not topic_key revisions or deduplication).
+		if months, ok := decayReviewAfterMonths[p.Type]; ok {
+			reviewAfter := time.Now().UTC().AddDate(0, months, 0).Format("2006-01-02 15:04:05")
+			if _, err := s.execHook(tx,
+				`UPDATE observations SET review_after = ? WHERE id = ?`,
+				reviewAfter, observationID,
+			); err != nil {
+				return fmt.Errorf("set review_after: %w", err)
+			}
+		}
+
 		obs, err = s.getObservationTx(tx, observationID)
 		if err != nil {
 			return err
@@ -2320,6 +2408,20 @@ func (s *Store) DeleteObservation(id int64, hardDelete bool) error {
 		if hardDelete {
 			if _, err := s.execHook(tx, `DELETE FROM observations WHERE id = ?`, id); err != nil {
 				return err
+			}
+			// ── Phase: memory-conflict-surfacing — C.11 ──────────────────────
+			// Orphan any memory_relations rows that reference this observation's
+			// sync_id (as source or target). Relations are never cascade-deleted;
+			// they become audit history with judgment_status='orphaned'.
+			if obs.SyncID != "" {
+				if _, err := s.execHook(tx, `
+					UPDATE memory_relations
+					SET judgment_status = 'orphaned',
+					    updated_at      = datetime('now')
+					WHERE source_id = ? OR target_id = ?
+				`, obs.SyncID, obs.SyncID); err != nil {
+					return fmt.Errorf("orphan memory_relations after hard-delete: %w", err)
+				}
 			}
 		} else {
 			if _, err := s.execHook(tx,
@@ -5541,4 +5643,60 @@ func ClassifyTool(toolName string) string {
 // Now returns the current time formatted for SQLite.
 func Now() string {
 	return time.Now().UTC().Format("2006-01-02 15:04:05")
+}
+
+// ─── Test-accessor helpers (REQ-009 / Phase G integration tests) ──────────────
+
+// CountRelationSyncMutations returns the number of sync_mutations rows whose
+// entity is NOT 'session', 'observation', or 'prompt' — i.e., any entity that
+// would indicate memory_relations data leaking into sync. Used by integration
+// tests to assert that relation operations never enqueue sync mutations (REQ-009).
+//
+// In Phase 1, only 'session', 'observation', and 'prompt' are valid entities.
+// Any other entity (e.g. 'relation', 'memory_relation') would be a regression.
+func (s *Store) CountRelationSyncMutations() (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT count(*)
+		FROM sync_mutations
+		WHERE entity NOT IN ('session', 'observation', 'prompt')
+	`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("CountRelationSyncMutations: %w", err)
+	}
+	return count, nil
+}
+
+// ListObservationSyncPayloads returns the decoded payloads of all sync_mutations
+// rows whose entity = 'observation'. Used by integration tests to assert that
+// new observation columns (review_after, expires_at, embedding*) are NOT present
+// in the sync wire format in Phase 1 (REQ-009).
+func (s *Store) ListObservationSyncPayloads() ([]any, error) {
+	rows, err := s.db.Query(`
+		SELECT payload
+		FROM sync_mutations
+		WHERE entity = 'observation'
+		ORDER BY seq ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListObservationSyncPayloads: query: %w", err)
+	}
+	defer rows.Close()
+
+	var payloads []any
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("ListObservationSyncPayloads: scan: %w", err)
+		}
+		var p syncObservationPayload
+		if err := json.Unmarshal([]byte(raw), &p); err != nil {
+			return nil, fmt.Errorf("ListObservationSyncPayloads: unmarshal: %w", err)
+		}
+		payloads = append(payloads, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListObservationSyncPayloads: rows error: %w", err)
+	}
+	return payloads, nil
 }

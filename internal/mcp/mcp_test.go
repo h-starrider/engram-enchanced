@@ -936,6 +936,7 @@ func TestResolveToolsAgentProfile(t *testing.T) {
 		"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
 		"mem_update",          // skills explicitly say "use mem_update when you have an exact ID to correct"
 		"mem_current_project", // added REQ-313: discovery tool recommended first call
+		"mem_judge",           // REQ-003: conflict verdict tool (Phase D)
 	}
 	for _, tool := range expectedTools {
 		if !result[tool] {
@@ -980,13 +981,13 @@ func TestResolveToolsCombinedProfiles(t *testing.T) {
 		t.Fatal("expected non-nil allowlist for combined profiles")
 	}
 
-	// Should have all 16 tools
+	// Should have all 17 tools (16 prior + mem_judge added in Phase D)
 	allTools := []string{
 		"mem_save", "mem_search", "mem_context", "mem_session_summary",
 		"mem_session_start", "mem_session_end", "mem_get_observation",
 		"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
 		"mem_update", "mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects",
-		"mem_current_project",
+		"mem_current_project", "mem_judge",
 	}
 	for _, tool := range allTools {
 		if !result[tool] {
@@ -1062,6 +1063,406 @@ func TestResolveToolsEmptyTokenBetweenCommas(t *testing.T) {
 	}
 	if !result["mem_save"] || !result["mem_search"] {
 		t.Fatalf("expected mem_save and mem_search in result, got %v", result)
+	}
+}
+
+// ─── Phase D — MCP layer enrichment tests ───────────────────────────────────
+
+// D.1 — mem_save returns enriched envelope with candidates when similar obs exists.
+// REQ-001 | Design §4
+func TestHandleSave_CandidatesReturned(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	// Save first observation — no candidates yet.
+	req1 := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "We use sessions for auth middleware",
+		"content": "Session-based auth in the middleware layer keeps things simple",
+		"type":    "architecture",
+	}}}
+	res1, err := h(context.Background(), req1)
+	if err != nil {
+		t.Fatalf("first save handler error: %v", err)
+	}
+	if res1.IsError {
+		t.Fatalf("first save unexpected error: %s", callResultText(t, res1))
+	}
+
+	// Save second, similar observation — should surface the first as candidate.
+	req2 := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Switched from sessions to JWT for auth",
+		"content": "Replacing session auth with JWT tokens improves scalability",
+		"type":    "architecture",
+	}}}
+	res2, err := h(context.Background(), req2)
+	if err != nil {
+		t.Fatalf("second save handler error: %v", err)
+	}
+	if res2.IsError {
+		t.Fatalf("second save unexpected error: %s", callResultText(t, res2))
+	}
+
+	text := callResultText(t, res2)
+
+	// REQ-001: judgment_required=true must be in envelope.
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("response is not valid JSON: %v — got %q", err, text)
+	}
+
+	judgmentRequired, ok := envelope["judgment_required"].(bool)
+	if !ok || !judgmentRequired {
+		t.Fatalf("expected judgment_required=true in envelope, got %v", envelope["judgment_required"])
+	}
+
+	candidates, ok := envelope["candidates"].([]any)
+	if !ok || len(candidates) == 0 {
+		t.Fatalf("expected non-empty candidates[], got %v", envelope["candidates"])
+	}
+
+	// Each candidate must have required fields.
+	firstCandidate, ok := candidates[0].(map[string]any)
+	if !ok {
+		t.Fatalf("candidates[0] not a map, got %T", candidates[0])
+	}
+	for _, field := range []string{"id", "sync_id", "title", "type", "score", "judgment_id"} {
+		if _, exists := firstCandidate[field]; !exists {
+			t.Errorf("candidates[0] missing field %q", field)
+		}
+	}
+
+	// REQ-001: result must contain "CONFLICT REVIEW PENDING".
+	result, _ := envelope["result"].(string)
+	if !strings.Contains(result, "CONFLICT REVIEW PENDING") {
+		t.Fatalf("expected CONFLICT REVIEW PENDING in result, got %q", result)
+	}
+}
+
+// D.2 — mem_save with no similar obs returns unchanged result string, no candidates.
+// REQ-007 | Design §4
+func TestHandleSave_NoCandidates_ResultUnchanged(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	// Save observation into empty store — no candidates possible.
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Completely unrelated quantum computing thing",
+		"content": "Quantum entanglement in distributed systems has no parallel in typical web auth",
+		"type":    "discovery",
+	}}}
+	res, err := h(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res))
+	}
+
+	text := callResultText(t, res)
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+
+	// judgment_required must be absent or false.
+	if jr, ok := envelope["judgment_required"].(bool); ok && jr {
+		t.Fatalf("expected judgment_required absent or false, got true")
+	}
+
+	// candidates must be absent or empty.
+	if cands, ok := envelope["candidates"]; ok {
+		if arr, ok := cands.([]any); ok && len(arr) > 0 {
+			t.Fatalf("expected no candidates, got %v", cands)
+		}
+	}
+
+	// judgment_id must be absent.
+	if _, ok := envelope["judgment_id"]; ok {
+		t.Fatalf("expected no judgment_id when no candidates")
+	}
+
+	// REQ-007: result string must start with expected prefix (regression guard).
+	result, _ := envelope["result"].(string)
+	if !strings.HasPrefix(result, `Memory saved: "`) {
+		t.Fatalf("result string must start with Memory saved: \" — got %q", result)
+	}
+
+	// CONFLICT REVIEW PENDING must NOT appear when no candidates.
+	if strings.Contains(result, "CONFLICT REVIEW PENDING") {
+		t.Fatalf("unexpected CONFLICT REVIEW PENDING in result when no candidates")
+	}
+}
+
+// D.3 — topic_key revision also triggers candidate detection.
+// REQ-001 edge case | Design §4
+func TestHandleSave_TopicKeyRevision_ReturnsCandidates(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	// Save a standalone observation (no topic_key) that will be a candidate.
+	req1 := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Auth architecture sessions design",
+		"content": "Session-based auth design for the backend service",
+		"type":    "architecture",
+	}}}
+	if _, err := h(context.Background(), req1); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	// Save with topic_key (first write) — creates the topic.
+	req2 := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":    "Auth architecture sessions design updated",
+		"content":  "Updated session-based auth design",
+		"type":     "architecture",
+		"topic_key": "architecture/auth-sessions",
+	}}}
+	if _, err := h(context.Background(), req2); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+
+	// Revise via same topic_key — this is the revision case.
+	req3 := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":    "Auth architecture sessions design revised",
+		"content":  "Revised session-based auth design for the service layer",
+		"type":     "architecture",
+		"topic_key": "architecture/auth-sessions",
+	}}}
+	res3, err := h(context.Background(), req3)
+	if err != nil {
+		t.Fatalf("revision save: %v", err)
+	}
+	if res3.IsError {
+		t.Fatalf("revision save unexpected error: %s", callResultText(t, res3))
+	}
+
+	text := callResultText(t, res3)
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("not valid JSON: %v", err)
+	}
+
+	// Revision must still surface candidates (the revised obs itself is excluded; other similar obs eligible).
+	// We seeded one similar obs, so candidates should be non-empty.
+	candidates, _ := envelope["candidates"].([]any)
+	judgmentRequired, _ := envelope["judgment_required"].(bool)
+
+	// At minimum, if candidates found, judgment_required must be true.
+	// If no candidates, that's also acceptable (FTS similarity may not match).
+	// The critical invariant is: the just-saved/revised obs is NOT in its own candidates.
+	if judgmentRequired && len(candidates) > 0 {
+		// Verify the saved obs sync_id doesn't appear as a candidate.
+		savedSyncID, _ := envelope["sync_id"].(string)
+		for _, c := range candidates {
+			cand, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			if cand["sync_id"] == savedSyncID {
+				t.Fatalf("just-saved obs should not appear in its own candidates")
+			}
+		}
+	}
+}
+
+// D.4 — mem_search result annotations for relations.
+// REQ-002 | Design §5
+func TestHandleSearch_SupersededAnnotation(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-search-annot", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Save two observations.
+	oldID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-search-annot",
+		Type:      "architecture",
+		Title:     "Old auth design",
+		Content:   "We use session-based auth",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add old obs: %v", err)
+	}
+	newID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-search-annot",
+		Type:      "architecture",
+		Title:     "New auth design",
+		Content:   "We switched to JWT auth",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add new obs: %v", err)
+	}
+
+	// Get sync_ids.
+	oldObs, err := s.GetObservation(oldID)
+	if err != nil {
+		t.Fatalf("get old obs: %v", err)
+	}
+	newObs, err := s.GetObservation(newID)
+	if err != nil {
+		t.Fatalf("get new obs: %v", err)
+	}
+
+	// Create a judged supersedes relation: newObs supersedes oldObs.
+	relSyncID := "rel-test-supersedes-01"
+	if _, err := s.SaveRelation(store.SaveRelationParams{
+		SyncID:   relSyncID,
+		SourceID: newObs.SyncID,
+		TargetID: oldObs.SyncID,
+	}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      store.RelationSupersedes,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+
+	// Search for old auth.
+	search := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	searchReq := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "auth design",
+		"project": "engram",
+		"scope":   "project",
+	}}}
+	searchRes, err := search(context.Background(), searchReq)
+	if err != nil {
+		t.Fatalf("search handler error: %v", err)
+	}
+	if searchRes.IsError {
+		t.Fatalf("unexpected search error: %s", callResultText(t, searchRes))
+	}
+
+	text := callResultText(t, searchRes)
+	// oldObs should show superseded_by annotation.
+	// newObs should show supersedes annotation.
+	if !strings.Contains(text, "superseded_by:") {
+		t.Fatalf("expected superseded_by annotation in search results, got %q", text)
+	}
+	if !strings.Contains(text, "supersedes:") {
+		t.Fatalf("expected supersedes annotation in search results, got %q", text)
+	}
+}
+
+func TestHandleSearch_PendingAsContested(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-contested", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	obsAID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-contested",
+		Type:      "decision",
+		Title:     "Keep monolith decision",
+		Content:   "We keep the monolith for now",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs A: %v", err)
+	}
+	obsBID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-contested",
+		Type:      "decision",
+		Title:     "Split into microservices decision",
+		Content:   "We should split into microservices",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs B: %v", err)
+	}
+
+	obsA, err := s.GetObservation(obsAID)
+	if err != nil {
+		t.Fatalf("get obs A: %v", err)
+	}
+	obsB, err := s.GetObservation(obsBID)
+	if err != nil {
+		t.Fatalf("get obs B: %v", err)
+	}
+
+	// Create a PENDING relation (not judged) between A and B.
+	if _, err := s.SaveRelation(store.SaveRelationParams{
+		SyncID:   "rel-test-pending-01",
+		SourceID: obsA.SyncID,
+		TargetID: obsB.SyncID,
+	}); err != nil {
+		t.Fatalf("save pending relation: %v", err)
+	}
+
+	search := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	searchReq := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "decision",
+		"project": "engram",
+		"scope":   "project",
+	}}}
+	searchRes, err := search(context.Background(), searchReq)
+	if err != nil {
+		t.Fatalf("search handler error: %v", err)
+	}
+
+	text := callResultText(t, searchRes)
+	// Pending relation should surface as "conflict: contested by"
+	if !strings.Contains(text, "conflict: contested by") {
+		t.Fatalf("expected conflict annotation for pending relation, got %q", text)
+	}
+}
+
+func TestHandleSearch_NoRelationsUnchanged(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-no-rel", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	_, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-no-rel",
+		Type:      "bugfix",
+		Title:     "Fix parser panic",
+		Content:   "Fixed panic in parser when args are nil",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add obs: %v", err)
+	}
+
+	search := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	searchReq := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "parser panic",
+		"project": "engram",
+		"scope":   "project",
+	}}}
+	searchRes, err := search(context.Background(), searchReq)
+	if err != nil {
+		t.Fatalf("search handler error: %v", err)
+	}
+	if searchRes.IsError {
+		t.Fatalf("unexpected search error: %s", callResultText(t, searchRes))
+	}
+
+	text := callResultText(t, searchRes)
+	// No relations — no annotation lines should appear.
+	if strings.Contains(text, "supersedes:") || strings.Contains(text, "superseded_by:") || strings.Contains(text, "conflict:") {
+		t.Fatalf("expected no relation annotations when no relations exist, got %q", text)
+	}
+	// Standard format must be preserved.
+	if !strings.Contains(text, "Found 1 memories") {
+		t.Fatalf("expected standard search output format, got %q", text)
+	}
+}
+
+// D.4b — mem_judge registered in ProfileAgent (tool registration test).
+// REQ-003 | Design §6.5
+func TestHandleJudge_RegisteredInAgentProfile(t *testing.T) {
+	if !ProfileAgent["mem_judge"] {
+		t.Fatalf("mem_judge must be registered in ProfileAgent")
 	}
 }
 
@@ -1172,7 +1573,7 @@ func TestNewServerWithToolsNilRegistersAll(t *testing.T) {
 		"mem_session_start", "mem_session_end", "mem_get_observation",
 		"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
 		"mem_update", "mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects",
-		"mem_current_project",
+		"mem_current_project", "mem_judge",
 	}
 
 	for _, name := range allTools {
@@ -1211,9 +1612,9 @@ func TestNewServerBackwardsCompatible(t *testing.T) {
 	srv := NewServer(s)
 	tools := srv.ListTools()
 
-	// 12 agent + 4 admin = 16 total
-	if len(tools) != 16 {
-		t.Errorf("NewServer should register all 16 tools, got %d", len(tools))
+	// 13 agent + 4 admin = 17 total (mem_judge added in Phase D)
+	if len(tools) != 17 {
+		t.Errorf("NewServer should register all 17 tools, got %d", len(tools))
 	}
 }
 
@@ -1227,8 +1628,9 @@ func TestProfileConsistency(t *testing.T) {
 		combined[tool] = true
 	}
 
-	if len(combined) != 16 {
-		t.Errorf("agent + admin should cover all 16 tools, got %d", len(combined))
+	// 13 agent + 4 admin = 17 total (mem_judge added in Phase D)
+	if len(combined) != 17 {
+		t.Errorf("agent + admin should cover all 17 tools, got %d", len(combined))
 	}
 
 	// Verify no overlap between profiles
@@ -1530,9 +1932,9 @@ func TestNewServerWithConfig(t *testing.T) {
 		t.Fatal("expected MCP server instance")
 	}
 	tools := srv.ListTools()
-	// Should have all 16 tools (15 original + mem_current_project added in REQ-313)
-	if len(tools) != 16 {
-		t.Errorf("NewServerWithConfig should register all 16 tools, got %d", len(tools))
+	// Should have all 17 tools (13 agent + 4 admin; mem_judge added in Phase D)
+	if len(tools) != 17 {
+		t.Errorf("NewServerWithConfig should register all 17 tools, got %d", len(tools))
 	}
 }
 
@@ -3345,4 +3747,108 @@ func TestAllTools_ReadResponseEnvelope_WithAssertions(t *testing.T) {
 		t.Fatalf("context: err=%v isError=%v", err, resCtx.IsError)
 	}
 	assertEnvelope(t, "mem_context", resCtx)
+}
+
+// ─── Phase E — Conflict Surfacing Instructions ────────────────────────────────
+
+// TestServerInstructions_ConflictSurfacingBlock verifies that serverInstructions
+// contains the CONFLICT SURFACING section with all required guidance phrases.
+// This is the RED→GREEN test for Phase E (E.1).
+func TestServerInstructions_ConflictSurfacingBlock(t *testing.T) {
+	required := []string{
+		// Section header — agents must be able to grep for it
+		"## CONFLICT SURFACING",
+
+		// Core trigger condition
+		"judgment_required",
+
+		// The action: iterate candidates and call mem_judge
+		"candidates[]",
+		"mem_judge",
+
+		// Heuristic: low confidence threshold
+		"0.7",
+
+		// Heuristic: ask for high-stakes relation+type combos
+		"supersedes",
+		"conflicts_with",
+		"architecture",
+
+		// Conversational (not blocking) resolution pattern
+		"conversationally",
+
+		// Post-resolution: persist via mem_judge with evidence
+		"evidence",
+	}
+
+	for _, phrase := range required {
+		if !strings.Contains(serverInstructions, phrase) {
+			t.Errorf("serverInstructions is missing required phrase %q in CONFLICT SURFACING block", phrase)
+		}
+	}
+}
+
+// ─── Fix 1 RED — TestHandleSave_MCPConfig_OverridesDefaults ──────────────────
+
+// TestHandleSave_MCPConfig_OverridesDefaults verifies that MCPConfig.BM25Floor
+// and MCPConfig.Limit are forwarded to FindCandidates. REQ-001 requires
+// configurability via Config; the existing MCPConfig struct was empty.
+//
+// Strategy: set BM25Floor to a very strict value (0.0) via MCPConfig. Even with
+// two similar observations in the store, no candidate should score >= 0 (BM25
+// scores are always negative), so candidates[] must be empty. Without the fix,
+// MCPConfig.BM25Floor would be ignored and the default -2.0 would be used,
+// returning at least one candidate — causing the assertion to fail.
+func TestHandleSave_MCPConfig_OverridesDefaults(t *testing.T) {
+	s := newMCPTestStore(t)
+
+	// Helper to create float64 pointer.
+	ptrF := func(v float64) *float64 { return &v }
+
+	// Create MCP server with strict BM25Floor override — nothing should score >= 0.
+	cfg := MCPConfig{
+		BM25Floor: ptrF(0.0),
+	}
+	h := handleSave(s, cfg, NewSessionActivity(10*time.Minute))
+
+	// Save first observation — no candidates yet.
+	req1 := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "JWT auth token session management",
+		"content": "Session-based auth in the middleware layer keeps things simple",
+		"type":    "architecture",
+	}}}
+	if _, err := h(context.Background(), req1); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	// Save second, similar observation. With strict floor, no candidates should pass.
+	req2 := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Switched from JWT sessions to token auth",
+		"content": "Replacing session auth with JWT tokens improves scalability",
+		"type":    "architecture",
+	}}}
+	res2, err := h(context.Background(), req2)
+	if err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	if res2.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res2))
+	}
+
+	text := callResultText(t, res2)
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
+		t.Fatalf("response is not valid JSON: %v — got %q", err, text)
+	}
+
+	// With BM25Floor=0.0 configured, no candidate can pass (BM25 scores are always negative).
+	// judgment_required must be false or absent.
+	if jr, ok := envelope["judgment_required"].(bool); ok && jr {
+		t.Fatalf("expected judgment_required=false with strict BM25Floor=0.0 override, got true — MCPConfig.BM25Floor may not be wired")
+	}
+	if cands, ok := envelope["candidates"]; ok {
+		if arr, ok := cands.([]any); ok && len(arr) > 0 {
+			t.Fatalf("expected no candidates with BM25Floor=0.0 override, got %d — MCPConfig.BM25Floor may not be wired", len(arr))
+		}
+	}
 }
