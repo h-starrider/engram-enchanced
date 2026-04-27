@@ -8,9 +8,15 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/mcp"
+	"github.com/Gentleman-Programming/engram/internal/obsidian"
+	"github.com/Gentleman-Programming/engram/internal/setup"
 	"github.com/Gentleman-Programming/engram/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
 	versioncheck "github.com/Gentleman-Programming/engram/internal/version"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 
 func testConfig(t *testing.T) store.Config {
@@ -160,28 +166,78 @@ func TestPrintUsage(t *testing.T) {
 	if !strings.Contains(stdout, "search <query>") || !strings.Contains(stdout, "setup [agent]") {
 		t.Fatalf("usage missing expected commands: %q", stdout)
 	}
+	if !strings.Contains(stdout, "cloud <subcommand>") {
+		t.Fatalf("usage missing cloud command tree: %q", stdout)
+	}
+	if !strings.Contains(stdout, "serve      Run cloud backend + dashboard") {
+		t.Fatalf("usage missing cloud serve command: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Required for cloud serve in BOTH token auth and insecure no-auth mode") {
+		t.Fatalf("usage missing updated ENGRAM_CLOUD_ALLOWED_PROJECTS contract: %q", stdout)
+	}
+	for _, token := range []string{
+		"ENGRAM_DATABASE_URL",
+		"ENGRAM_CLOUD_HOST",
+		"ENGRAM_CLOUD_TOKEN",
+		"ENGRAM_CLOUD_INSECURE_NO_AUTH",
+		"Cannot be combined with ENGRAM_CLOUD_TOKEN",
+		"Cannot be combined with ENGRAM_CLOUD_ADMIN",
+		"ENGRAM_CLOUD_ADMIN",
+	} {
+		if !strings.Contains(stdout, token) {
+			t.Fatalf("usage missing cloud serve env/runtime rule %q: %q", token, stdout)
+		}
+	}
 }
 
 func TestPrintPostInstall(t *testing.T) {
 	tests := []struct {
-		agent   string
-		expects []string
+		name       string
+		result     *setup.Result
+		expects    []string
+		notExpects []string
 	}{
-		{agent: "opencode", expects: []string{"Restart OpenCode", "engram serve &"}},
-		{agent: "gemini-cli", expects: []string{"Restart Gemini CLI", "~/.gemini/settings.json"}},
-		{agent: "codex", expects: []string{"Restart Codex", "~/.codex/config.toml"}},
-		{agent: "unknown", expects: nil},
+		{
+			name:    "opencode with subagent monitor enabled",
+			result:  &setup.Result{Agent: "opencode", TUIPluginEnabled: true},
+			expects: []string{"Restart OpenCode", "opencode-subagent-statusline", "engram serve &"},
+		},
+		{
+			name:       "opencode with subagent monitor not enabled",
+			result:     &setup.Result{Agent: "opencode", TUIPluginEnabled: false},
+			expects:    []string{"Restart OpenCode", "engram serve &"},
+			notExpects: []string{"opencode-subagent-statusline"},
+		},
+		{
+			name:    "gemini-cli",
+			result:  &setup.Result{Agent: "gemini-cli"},
+			expects: []string{"Restart Gemini CLI", "~/.gemini/settings.json"},
+		},
+		{
+			name:    "codex",
+			result:  &setup.Result{Agent: "codex"},
+			expects: []string{"Restart Codex", "~/.codex/config.toml"},
+		},
+		{
+			name:   "unknown",
+			result: &setup.Result{Agent: "unknown"},
+		},
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.agent, func(t *testing.T) {
-			stdout, stderr := captureOutput(t, func() { printPostInstall(tc.agent) })
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr := captureOutput(t, func() { printPostInstall(tc.result) })
 			if stderr != "" {
 				t.Fatalf("expected no stderr, got: %q", stderr)
 			}
 			for _, expected := range tc.expects {
 				if !strings.Contains(stdout, expected) {
 					t.Fatalf("output missing %q: %q", expected, stdout)
+				}
+			}
+			for _, forbidden := range tc.notExpects {
+				if strings.Contains(stdout, forbidden) {
+					t.Fatalf("output unexpectedly contains %q: %q", forbidden, stdout)
 				}
 			}
 			if len(tc.expects) == 0 && stdout != "" {
@@ -211,7 +267,7 @@ func TestPrintPostInstallClaudeCodeAllowlist(t *testing.T) {
 			return nil
 		}
 
-		stdout, _ := captureOutput(t, func() { printPostInstall("claude-code") })
+		stdout, _ := captureOutput(t, func() { printPostInstall(&setup.Result{Agent: "claude-code"}) })
 		if !allowlistCalled {
 			t.Fatalf("expected AddClaudeCodeAllowlist to be called")
 		}
@@ -242,7 +298,7 @@ func TestPrintPostInstallClaudeCodeAllowlist(t *testing.T) {
 			return nil
 		}
 
-		stdout, _ := captureOutput(t, func() { printPostInstall("claude-code") })
+		stdout, _ := captureOutput(t, func() { printPostInstall(&setup.Result{Agent: "claude-code"}) })
 		if allowlistCalled {
 			t.Fatalf("expected AddClaudeCodeAllowlist NOT to be called")
 		}
@@ -268,11 +324,78 @@ func TestPrintPostInstallClaudeCodeAllowlist(t *testing.T) {
 			return os.ErrPermission
 		}
 
-		_, stderr := captureOutput(t, func() { printPostInstall("claude-code") })
+		_, stderr := captureOutput(t, func() { printPostInstall(&setup.Result{Agent: "claude-code"}) })
 		if !strings.Contains(stderr, "warning") {
 			t.Fatalf("expected warning in stderr, got: %q", stderr)
 		}
 	})
+}
+
+func TestCmdSyncCloudRegressionPreservesLegacyBehaviorWithUpgradeStatePresent(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	originalSyncExport := syncExport
+	originalSyncStatus := syncStatus
+	t.Cleanup(func() {
+		syncExport = originalSyncExport
+		syncStatus = originalSyncStatus
+	})
+
+	cfg := testConfig(t)
+	t.Setenv("ENGRAM_CLOUD_SERVER", "https://cloud.example.test")
+	t.Setenv("ENGRAM_CLOUD_TOKEN", "token-abc")
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	if err := s.EnrollProject("proj-a"); err != nil {
+		_ = s.Close()
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+		Project:          "proj-a",
+		Stage:            store.UpgradeStageDoctorBlocked,
+		RepairClass:      store.UpgradeRepairClassRepairable,
+		LastErrorCode:    "upgrade_repairable_unenrolled",
+		LastErrorMessage: "legacy metadata drift",
+	}); err != nil {
+		_ = s.Close()
+		t.Fatalf("seed upgrade state: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	syncExport = func(*engramsync.Syncer, string, string) (*engramsync.SyncResult, error) {
+		return &engramsync.SyncResult{ChunkID: "chunk-regression", SessionsExported: 1}, nil
+	}
+	syncStatus = func(*engramsync.Syncer) (int, int, int, error) {
+		return 1, 1, 0, nil
+	}
+
+	withArgs(t, "engram", "sync", "--cloud", "--project", "proj-a")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("cloud sync regression path should stay successful, panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "Cloud sync complete for project \"proj-a\".") {
+		t.Fatalf("expected unchanged cloud sync success messaging, got %q", stdout)
+	}
+
+	s, err = store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New (verify): %v", err)
+	}
+	defer s.Close()
+	state, err := s.GetCloudUpgradeState("proj-a")
+	if err != nil {
+		t.Fatalf("load upgrade state: %v", err)
+	}
+	if state == nil || state.Stage != store.UpgradeStageDoctorBlocked {
+		t.Fatalf("sync --cloud must not mutate upgrade stage; got %+v", state)
+	}
 }
 
 func TestCmdSaveAndSearch(t *testing.T) {
@@ -578,6 +701,9 @@ func TestMainExitPaths(t *testing.T) {
 	}{
 		{name: "no args", helperCase: "no-args", expectedOutput: "Usage:", expectedExitOne: true},
 		{name: "unknown command", helperCase: "unknown", expectedOutput: "Usage:", expectedStderr: "unknown command:", expectedExitOne: true},
+		{name: "cloud missing subcommand", helperCase: "cloud-missing", expectedOutput: "usage: engram cloud", expectedExitOne: true},
+		{name: "cloud unknown subcommand", helperCase: "cloud-unknown", expectedOutput: "supported subcommands", expectedStderr: "unknown cloud command", expectedExitOne: true},
+		{name: "cloud enroll missing project", helperCase: "cloud-enroll-missing", expectedOutput: "usage: engram cloud enroll <project>", expectedExitOne: true},
 	}
 
 	for _, tc := range tests {
@@ -619,6 +745,12 @@ func TestMainExitHelper(t *testing.T) {
 		os.Args = []string{"engram"}
 	case "unknown":
 		os.Args = []string{"engram", "definitely-unknown-command"}
+	case "cloud-missing":
+		os.Args = []string{"engram", "cloud"}
+	case "cloud-unknown":
+		os.Args = []string{"engram", "cloud", "nope"}
+	case "cloud-enroll-missing":
+		os.Args = []string{"engram", "cloud", "enroll"}
 	default:
 		os.Args = []string{"engram", "--help"}
 	}
@@ -637,5 +769,680 @@ func TestCmdSearchLocalMode(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Found") && !strings.Contains(stdout, "local-result") {
 		t.Fatalf("expected local search results, got: %q", stdout)
+	}
+}
+
+// ─── Projects command tests ───────────────────────────────────────────────────
+
+func TestCmdProjectsListEmpty(t *testing.T) {
+	cfg := testConfig(t)
+
+	withArgs(t, "engram", "projects", "list")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsList(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "No projects found") {
+		t.Fatalf("expected empty projects message, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsList(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed observations for two projects
+	mustSeedObservation(t, cfg, "s-alpha", "alpha", "note", "alpha-note", "alpha content", "project")
+	mustSeedObservation(t, cfg, "s-alpha", "alpha", "bugfix", "alpha-bug", "alpha bug", "project")
+	mustSeedObservation(t, cfg, "s-beta", "beta", "decision", "beta-note", "beta content", "project")
+
+	withArgs(t, "engram", "projects", "list")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsList(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "Projects (2)") {
+		t.Fatalf("expected 'Projects (2)', got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "alpha") || !strings.Contains(stdout, "beta") {
+		t.Fatalf("expected project names in output, got: %q", stdout)
+	}
+	// alpha has 2 observations, beta has 1 — alpha should appear first
+	alphaIdx := strings.Index(stdout, "alpha")
+	betaIdx := strings.Index(stdout, "beta")
+	if alphaIdx > betaIdx {
+		t.Fatalf("expected alpha (more obs) before beta, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsRoutesSubcommands(t *testing.T) {
+	cfg := testConfig(t)
+
+	// "list" subcommand
+	withArgs(t, "engram", "projects", "list")
+	stdout, _ := captureOutput(t, func() { cmdProjects(cfg) })
+	if !strings.Contains(stdout, "No projects found") && !strings.Contains(stdout, "Projects") {
+		t.Fatalf("expected projects list output, got: %q", stdout)
+	}
+
+	// default (no subcommand) → list
+	withArgs(t, "engram", "projects")
+	stdout2, _ := captureOutput(t, func() { cmdProjects(cfg) })
+	_ = stdout2 // just checking it doesn't crash
+}
+
+func TestCmdProjectsConsolidateNoSimilar(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed a single unique project
+	mustSeedObservation(t, cfg, "s-unique", "unique-project", "note", "unique note", "content", "project")
+
+	// Set cwd to a temp dir named "unique-project" with no git
+	workDir := filepath.Join(t.TempDir(), "unique-project")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	withCwd(t, workDir)
+
+	// Stub detectProject to return the known canonical
+	old := detectProject
+	detectProject = func(string) string { return "unique-project" }
+	t.Cleanup(func() { detectProject = old })
+
+	withArgs(t, "engram", "projects", "consolidate")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "No similar") {
+		t.Fatalf("expected no-similar message, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsConsolidateDryRun(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed a canonical and a similar variant (substring match, distinct after normalize)
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+
+	old := detectProject
+	detectProject = func(string) string { return "engram" }
+	t.Cleanup(func() { detectProject = old })
+
+	withArgs(t, "engram", "projects", "consolidate", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "dry-run") {
+		t.Fatalf("expected dry-run message, got: %q", stdout)
+	}
+	// Verify no actual merge happened (both projects still exist)
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	names, err := s.ListProjectNames()
+	if err != nil {
+		t.Fatalf("ListProjectNames: %v", err)
+	}
+	// Should still have both names (no merge happened)
+	if len(names) < 2 {
+		t.Fatalf("expected 2 project names after dry-run, got: %v", names)
+	}
+}
+
+func TestCmdProjectsConsolidateSingleProject(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed canonical and a similar variant (substring match, distinct after normalize)
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+
+	old := detectProject
+	detectProject = func(string) string { return "engram" }
+	t.Cleanup(func() { detectProject = old })
+
+	// Stub scanInputLine to answer "all"
+	oldScan := scanInputLine
+	t.Cleanup(func() { scanInputLine = oldScan })
+	scanInputLine = func(a ...any) (int, error) {
+		if ptr, ok := a[0].(*string); ok {
+			*ptr = "all"
+		}
+		return 1, nil
+	}
+
+	withArgs(t, "engram", "projects", "consolidate")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "Merged into") {
+		t.Fatalf("expected merge result, got: %q", stdout)
+	}
+
+	// Verify engram-memory was merged into engram
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	names, err := s.ListProjectNames()
+	if err != nil {
+		t.Fatalf("ListProjectNames: %v", err)
+	}
+	if len(names) != 1 || names[0] != "engram" {
+		t.Fatalf("expected only 'engram' after merge, got: %v", names)
+	}
+}
+
+func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed similar projects (substring match, stays distinct after normalize)
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+
+	withArgs(t, "engram", "projects", "consolidate", "--all", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "dry-run") || !strings.Contains(stdout, "Group") {
+		t.Fatalf("expected dry-run group output, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsAllNoGroups(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed completely unrelated projects
+	mustSeedObservation(t, cfg, "s-foo", "fooproject", "note", "foo", "content", "project")
+	mustSeedObservation(t, cfg, "s-bar", "barproject", "note", "bar", "content", "project")
+	mustSeedObservation(t, cfg, "s-qux", "quxproject", "note", "qux", "content", "project")
+
+	withArgs(t, "engram", "projects", "consolidate", "--all")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	// The three "project"-suffixed names might be grouped by similarity.
+	// We just verify it runs without error and produces readable output.
+	_ = stdout
+}
+
+func TestCmdMCPDetectsProjectFromFlag(t *testing.T) {
+	// JR2-4: --project flag is no longer used (dead code removed). The --project flag
+	// is now silently ignored; project is auto-detected from cwd at each MCP call.
+	// This test verifies cmdMCP still starts correctly when an unknown flag is passed.
+	cfg := testConfig(t)
+
+	var capturedCfg mcp.MCPConfig
+	oldNew := newMCPServerWithConfig
+	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
+	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		capturedCfg = mcpCfg
+		// Return a valid server so serveMCP doesn't panic
+		return oldNew(s, mcpCfg, allowlist)
+	}
+
+	oldServe := serveMCP
+	t.Cleanup(func() { serveMCP = oldServe })
+	// Prevent actual stdio serve — return immediately
+	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
+		return nil
+	}
+
+	withArgs(t, "engram", "mcp", "--project=myproject")
+	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
+
+	// JW6: MCPConfig.DefaultProject removed — verify cmdMCP still calls newMCPServerWithConfig.
+	// The project flag is parsed but project is now auto-detected per call, not stored in config.
+	_ = capturedCfg // MCPConfig{} — no fields to assert
+}
+
+func TestCmdMCPDetectsProjectFromEnv(t *testing.T) {
+	cfg := testConfig(t)
+
+	t.Setenv("ENGRAM_PROJECT", "env-project")
+
+	var capturedCfg mcp.MCPConfig
+	oldNew := newMCPServerWithConfig
+	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
+	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		capturedCfg = mcpCfg
+		return oldNew(s, mcpCfg, allowlist)
+	}
+
+	oldServe := serveMCP
+	t.Cleanup(func() { serveMCP = oldServe })
+	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
+		return nil
+	}
+
+	withArgs(t, "engram", "mcp")
+	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
+
+	// JW6: MCPConfig.DefaultProject removed — just verify cmdMCP completes without panic.
+	_ = capturedCfg
+}
+
+func TestCmdMCPDetectsProjectFromGit(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Stub detectProject to simulate git detection
+	old := detectProject
+	t.Cleanup(func() { detectProject = old })
+	detectProject = func(string) string { return "detected-from-git" }
+
+	var capturedCfg mcp.MCPConfig
+	oldNew := newMCPServerWithConfig
+	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
+	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		capturedCfg = mcpCfg
+		return oldNew(s, mcpCfg, allowlist)
+	}
+
+	oldServe := serveMCP
+	t.Cleanup(func() { serveMCP = oldServe })
+	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
+		return nil
+	}
+
+	withArgs(t, "engram", "mcp")
+	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
+
+	// JW6: MCPConfig.DefaultProject removed — just verify cmdMCP completes without panic.
+	_ = capturedCfg
+}
+
+func TestCmdSyncUsesDetectProject(t *testing.T) {
+	workDir := t.TempDir()
+	withCwd(t, workDir)
+
+	cfg := testConfig(t)
+
+	// Stub detectProject to verify it's called instead of filepath.Base
+	old := detectProject
+	t.Cleanup(func() { detectProject = old })
+	detectProject = func(dir string) string { return "git-detected-project" }
+
+	withArgs(t, "engram", "sync")
+	stdout, stderr := captureOutput(t, func() { cmdSync(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "git-detected-project") {
+		t.Fatalf("expected detectProject result in output, got: %q", stdout)
+	}
+}
+
+// ─── obsidian-export command tests ───────────────────────────────────────────
+
+// TestObsidianExportMissingVault verifies that omitting --vault exits with code 1
+// and prints an error message to stderr (REQ-EXPORT-01: missing --vault scenario).
+func TestObsidianExportMissingVault(t *testing.T) {
+	cfg := testConfig(t)
+
+	var exitCode int
+	oldExit := exitFunc
+	t.Cleanup(func() { exitFunc = oldExit })
+	exitFunc = func(code int) { exitCode = code; panic("exit") }
+
+	withArgs(t, "engram", "obsidian-export", "--project", "eng")
+
+	// Capture stderr before the panic unwinds by closing pipes inside captureOutput.
+	// We use a wrapper that recovers from the exitFunc panic and then still closes
+	// the write-end pipes so ReadAll can drain them.
+	oldOut := os.Stdout
+	oldErr := os.Stderr
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	os.Stdout = outW
+	os.Stderr = errW
+
+	func() {
+		defer func() {
+			recover() //nolint:errcheck
+		}()
+		cmdObsidianExport(cfg)
+	}()
+
+	_ = outW.Close()
+	_ = errW.Close()
+	os.Stdout = oldOut
+	os.Stderr = oldErr
+
+	errBytes, _ := io.ReadAll(errR)
+	_, _ = io.ReadAll(outR)
+	stderr := string(errBytes)
+
+	if exitCode != 1 {
+		t.Fatalf("expected exit code 1, got %d", exitCode)
+	}
+	if !strings.Contains(stderr, "--vault") {
+		t.Fatalf("expected '--vault' in stderr, got: %q", stderr)
+	}
+}
+
+// TestObsidianExportCallsInjectedExporter verifies that when --vault is provided,
+// the injected newObsidianExporter is called with the correct config
+// (REQ-EXPORT-01: happy path with all flags).
+func TestObsidianExportCallsInjectedExporter(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	// Track the ExportConfig passed to the injected constructor
+	var capturedCfg obsidian.ExportConfig
+	exporterCalled := false
+
+	oldNew := newObsidianExporter
+	t.Cleanup(func() { newObsidianExporter = oldNew })
+	newObsidianExporter = func(s obsidian.StoreReader, c obsidian.ExportConfig) *obsidian.Exporter {
+		capturedCfg = c
+		exporterCalled = true
+		return obsidian.NewExporter(s, c)
+	}
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--project", "eng",
+		"--limit", "50",
+		"--since", "2026-01-01",
+	)
+
+	_, _ = captureOutput(t, func() { cmdObsidianExport(cfg) })
+
+	if !exporterCalled {
+		t.Fatalf("expected newObsidianExporter to be called")
+	}
+	if capturedCfg.VaultPath != vaultDir {
+		t.Fatalf("expected VaultPath=%q, got %q", vaultDir, capturedCfg.VaultPath)
+	}
+	if capturedCfg.Project != "eng" {
+		t.Fatalf("expected Project=%q, got %q", "eng", capturedCfg.Project)
+	}
+	if capturedCfg.Limit != 50 {
+		t.Fatalf("expected Limit=50, got %d", capturedCfg.Limit)
+	}
+	if capturedCfg.Since.IsZero() {
+		t.Fatalf("expected Since to be set from --since 2026-01-01, got zero")
+	}
+}
+
+// TestObsidianExportMinimalFlags verifies that only --vault (the required flag)
+// is sufficient — optional flags default to zero values (triangulation case).
+func TestObsidianExportMinimalFlags(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	var capturedCfg obsidian.ExportConfig
+	oldNew := newObsidianExporter
+	t.Cleanup(func() { newObsidianExporter = oldNew })
+	newObsidianExporter = func(s obsidian.StoreReader, c obsidian.ExportConfig) *obsidian.Exporter {
+		capturedCfg = c
+		return obsidian.NewExporter(s, c)
+	}
+
+	withArgs(t, "engram", "obsidian-export", "--vault", vaultDir)
+
+	_, _ = captureOutput(t, func() { cmdObsidianExport(cfg) })
+
+	if capturedCfg.VaultPath != vaultDir {
+		t.Fatalf("expected VaultPath=%q, got %q", vaultDir, capturedCfg.VaultPath)
+	}
+	// Optional flags should be zero
+	if capturedCfg.Project != "" {
+		t.Fatalf("expected empty Project, got %q", capturedCfg.Project)
+	}
+	if capturedCfg.Limit != 0 {
+		t.Fatalf("expected Limit=0, got %d", capturedCfg.Limit)
+	}
+	if !capturedCfg.Since.IsZero() {
+		t.Fatalf("expected Since=zero, got %v", capturedCfg.Since)
+	}
+}
+
+// TestObsidianExportInHelpText verifies that "obsidian-export" appears in printUsage output.
+func TestObsidianExportInHelpText(t *testing.T) {
+	stdout, _ := captureOutput(t, func() { printUsage() })
+	if !strings.Contains(stdout, "obsidian-export") {
+		t.Fatalf("expected 'obsidian-export' in help text, got: %q", stdout)
+	}
+}
+
+// ─── obsidian-export Phase 4 tests (graph-config, watch, interval) ───────────
+
+// captureExitPanic is a helper that runs fn inside a panic-recovering wrapper,
+// captures stdout/stderr via os.Pipe, and returns the exit code (via exitFunc stub).
+func captureExitPanic(t *testing.T, fn func()) (stdout, stderr string, exitCode int) {
+	t.Helper()
+
+	oldExit := exitFunc
+	t.Cleanup(func() { exitFunc = oldExit })
+	exitFunc = func(code int) { exitCode = code; panic("exit") }
+
+	oldOut := os.Stdout
+	oldErr := os.Stderr
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	os.Stdout = outW
+	os.Stderr = errW
+
+	func() {
+		defer func() { recover() }() //nolint:errcheck
+		fn()
+	}()
+
+	_ = outW.Close()
+	_ = errW.Close()
+	os.Stdout = oldOut
+	os.Stderr = oldErr
+
+	outBytes, _ := io.ReadAll(outR)
+	errBytes, _ := io.ReadAll(errR)
+	return string(outBytes), string(errBytes), exitCode
+}
+
+// TestObsidianExportGraphConfigInvalid verifies that --graph-config with an
+// invalid value exits 1 and prints an error to stderr. (REQ-GRAPH-01)
+func TestObsidianExportGraphConfigInvalid(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--graph-config", "bananas",
+	)
+
+	_, stderr, code := captureExitPanic(t, func() { cmdObsidianExport(cfg) })
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr, "graph-config") {
+		t.Fatalf("expected 'graph-config' in stderr, got: %q", stderr)
+	}
+}
+
+// TestObsidianExportGraphConfigDefaultsToPreserve verifies that when --graph-config
+// is not set, the exporter is called with GraphConfigPreserve. (REQ-GRAPH-01)
+func TestObsidianExportGraphConfigDefaultsToPreserve(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	var capturedCfg obsidian.ExportConfig
+	oldNew := newObsidianExporter
+	t.Cleanup(func() { newObsidianExporter = oldNew })
+	newObsidianExporter = func(s obsidian.StoreReader, c obsidian.ExportConfig) *obsidian.Exporter {
+		capturedCfg = c
+		return obsidian.NewExporter(s, c)
+	}
+
+	withArgs(t, "engram", "obsidian-export", "--vault", vaultDir)
+
+	_, _ = captureOutput(t, func() { cmdObsidianExport(cfg) })
+
+	if capturedCfg.GraphConfig != obsidian.GraphConfigPreserve {
+		t.Fatalf("expected GraphConfig=%q (preserve), got %q", obsidian.GraphConfigPreserve, capturedCfg.GraphConfig)
+	}
+}
+
+// TestObsidianExportWatchRequiresInterval verifies that --watch alone uses
+// the default 10m interval and does NOT exit with an error. (REQ-WATCH-02)
+func TestObsidianExportWatchRequiresInterval(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	// Inject a fake watcher that records the call and returns immediately.
+	var watcherCalled bool
+	var capturedInterval time.Duration
+	oldWatcher := newObsidianWatcher
+	t.Cleanup(func() { newObsidianWatcher = oldWatcher })
+	newObsidianWatcher = func(wc obsidian.WatcherConfig) *obsidian.Watcher {
+		watcherCalled = true
+		capturedInterval = wc.Interval
+		return nil // nil signals the CLI to skip watcher.Run()
+	}
+
+	withArgs(t, "engram", "obsidian-export", "--vault", vaultDir, "--watch")
+
+	// --watch with nil watcher should not panic and should not exit 1
+	var exitCode int
+	oldExit := exitFunc
+	t.Cleanup(func() { exitFunc = oldExit })
+	exitFunc = func(code int) { exitCode = code; panic("exit") }
+
+	func() {
+		defer func() { recover() }() //nolint:errcheck
+		_, _ = captureOutput(t, func() { cmdObsidianExport(cfg) })
+	}()
+
+	// Exit code should be 0 (clean exit after watcher returns nil)
+	if exitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", exitCode)
+	}
+	if !watcherCalled {
+		t.Fatalf("expected newObsidianWatcher to be called")
+	}
+	if capturedInterval != 10*time.Minute {
+		t.Fatalf("expected default interval 10m, got %v", capturedInterval)
+	}
+}
+
+// TestObsidianExportIntervalWithoutWatchErrors verifies that --interval without
+// --watch exits 1. (REQ-WATCH-07)
+func TestObsidianExportIntervalWithoutWatchErrors(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--interval", "5m",
+	)
+
+	_, stderr, code := captureExitPanic(t, func() { cmdObsidianExport(cfg) })
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr, "--interval") && !strings.Contains(stderr, "watch") {
+		t.Fatalf("expected '--interval' or 'watch' in stderr, got: %q", stderr)
+	}
+}
+
+// TestObsidianExportIntervalBelowMinimumErrors verifies that --watch --interval 30s
+// exits 1 because the interval is below the 1-minute minimum. (REQ-WATCH-07)
+func TestObsidianExportIntervalBelowMinimumErrors(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--watch",
+		"--interval", "30s",
+	)
+
+	_, stderr, code := captureExitPanic(t, func() { cmdObsidianExport(cfg) })
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr, "1m") && !strings.Contains(stderr, "minimum") {
+		t.Fatalf("expected minimum interval message in stderr, got: %q", stderr)
+	}
+}
+
+// TestObsidianExportIntervalUnparseableErrors verifies that --watch --interval banana
+// exits 1 with a parse error. (REQ-WATCH-07)
+func TestObsidianExportIntervalUnparseableErrors(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--watch",
+		"--interval", "banana",
+	)
+
+	_, stderr, code := captureExitPanic(t, func() { cmdObsidianExport(cfg) })
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr, "interval") {
+		t.Fatalf("expected 'interval' in stderr, got: %q", stderr)
+	}
+}
+
+// TestObsidianExportWatchModeCallsInjectedWatcher verifies that with --watch,
+// the injected newObsidianWatcher is called with the correct WatcherConfig.
+// Uses a fake that records the call. (REQ-WATCH-01)
+func TestObsidianExportWatchModeCallsInjectedWatcher(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	var watcherCfg obsidian.WatcherConfig
+	watcherCalled := false
+	oldWatcher := newObsidianWatcher
+	t.Cleanup(func() { newObsidianWatcher = oldWatcher })
+	newObsidianWatcher = func(wc obsidian.WatcherConfig) *obsidian.Watcher {
+		watcherCalled = true
+		watcherCfg = wc
+		return nil // nil means Run() is skipped; clean exit
+	}
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--watch",
+		"--interval", "2m",
+	)
+
+	var exitCode int
+	oldExit := exitFunc
+	t.Cleanup(func() { exitFunc = oldExit })
+	exitFunc = func(code int) { exitCode = code; panic("exit") }
+
+	func() {
+		defer func() { recover() }() //nolint:errcheck
+		_, _ = captureOutput(t, func() { cmdObsidianExport(cfg) })
+	}()
+
+	if exitCode != 0 {
+		t.Fatalf("expected clean exit (0), got %d", exitCode)
+	}
+	if !watcherCalled {
+		t.Fatalf("expected newObsidianWatcher to be called")
+	}
+	if watcherCfg.Interval != 2*time.Minute {
+		t.Fatalf("expected interval 2m, got %v", watcherCfg.Interval)
+	}
+	if watcherCfg.Exporter == nil {
+		t.Fatalf("expected non-nil Exporter in WatcherConfig")
+	}
+	if watcherCfg.Logf == nil {
+		t.Fatalf("expected non-nil Logf in WatcherConfig")
 	}
 }
