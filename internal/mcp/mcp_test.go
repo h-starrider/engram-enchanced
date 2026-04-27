@@ -46,6 +46,31 @@ func callResultText(t *testing.T, res *mcppkg.CallToolResult) string {
 	return text.Text
 }
 
+func assertSessionSyncMutationDirectory(t *testing.T, s *store.Store, sessionID, wantDirectory string) {
+	t.Helper()
+
+	mutations, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatalf("list pending sync mutations: %v", err)
+	}
+
+	for _, mutation := range mutations {
+		if mutation.Entity != store.SyncEntitySession || mutation.EntityKey != sessionID || mutation.Op != store.SyncOpUpsert {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(mutation.Payload), &payload); err != nil {
+			t.Fatalf("decode session sync payload: %v", err)
+		}
+		if got := payload["directory"]; got != wantDirectory {
+			t.Fatalf("expected session sync payload directory %q, got %#v in payload %s", wantDirectory, got, mutation.Payload)
+		}
+		return
+	}
+
+	t.Fatalf("expected pending session upsert sync mutation for %q; got %#v", sessionID, mutations)
+}
+
 func TestNewServerRegistersTools(t *testing.T) {
 	s := newMCPTestStore(t)
 	srv := NewServer(s)
@@ -1211,9 +1236,9 @@ func TestHandleSave_TopicKeyRevision_ReturnsCandidates(t *testing.T) {
 
 	// Save with topic_key (first write) — creates the topic.
 	req2 := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
-		"title":    "Auth architecture sessions design updated",
-		"content":  "Updated session-based auth design",
-		"type":     "architecture",
+		"title":     "Auth architecture sessions design updated",
+		"content":   "Updated session-based auth design",
+		"type":      "architecture",
 		"topic_key": "architecture/auth-sessions",
 	}}}
 	if _, err := h(context.Background(), req2); err != nil {
@@ -1222,9 +1247,9 @@ func TestHandleSave_TopicKeyRevision_ReturnsCandidates(t *testing.T) {
 
 	// Revise via same topic_key — this is the revision case.
 	req3 := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
-		"title":    "Auth architecture sessions design revised",
-		"content":  "Revised session-based auth design for the service layer",
-		"type":     "architecture",
+		"title":     "Auth architecture sessions design revised",
+		"content":   "Revised session-based auth design for the service layer",
+		"type":      "architecture",
 		"topic_key": "architecture/auth-sessions",
 	}}}
 	res3, err := h(context.Background(), req3)
@@ -1772,6 +1797,9 @@ func TestHandleSaveCreatesProjectScopedSession(t *testing.T) {
 		t.Fatalf("git remote add: %v\n%s", err, out)
 	}
 	t.Chdir(dir)
+	if err := s.EnrollProject("scoped-session-project"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
 
 	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"title":   "Decision",
@@ -1791,6 +1819,10 @@ func TestHandleSaveCreatesProjectScopedSession(t *testing.T) {
 	if sess.Project != "scoped-session-project" {
 		t.Fatalf("expected project=scoped-session-project, got %q", sess.Project)
 	}
+	if sess.Directory != dir {
+		t.Fatalf("expected directory=%q, got %q", dir, sess.Directory)
+	}
+	assertSessionSyncMutationDirectory(t, s, "manual-save-scoped-session-project", dir)
 }
 
 func TestHandleSavePromptCreatesProjectScopedSession(t *testing.T) {
@@ -1806,6 +1838,9 @@ func TestHandleSavePromptCreatesProjectScopedSession(t *testing.T) {
 		t.Fatalf("git remote add: %v\n%s", err, out)
 	}
 	t.Chdir(dir)
+	if err := s.EnrollProject("prompt-project"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
 
 	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"content": "How do I set up auth?",
@@ -1815,9 +1850,14 @@ func TestHandleSavePromptCreatesProjectScopedSession(t *testing.T) {
 		t.Fatalf("save prompt: err=%v isError=%v", err, res.IsError)
 	}
 
-	if _, err := s.GetSession("manual-save-prompt-project"); err != nil {
+	sess, err := s.GetSession("manual-save-prompt-project")
+	if err != nil {
 		t.Fatalf("expected session manual-save-prompt-project: %v", err)
 	}
+	if sess.Directory != dir {
+		t.Fatalf("expected directory=%q, got %q", dir, sess.Directory)
+	}
+	assertSessionSyncMutationDirectory(t, s, "manual-save-prompt-project", dir)
 }
 
 func TestHandleSessionSummaryCreatesProjectScopedSession(t *testing.T) {
@@ -1833,6 +1873,9 @@ func TestHandleSessionSummaryCreatesProjectScopedSession(t *testing.T) {
 	t.Chdir(dir)
 
 	s := newMCPTestStore(t)
+	if err := s.EnrollProject("summary-session-project"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
 	h := handleSessionSummary(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
 
 	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
@@ -1843,9 +1886,14 @@ func TestHandleSessionSummaryCreatesProjectScopedSession(t *testing.T) {
 		t.Fatalf("session summary: err=%v isError=%v text=%s", err, res.IsError, callResultText(t, res))
 	}
 
-	if _, err := s.GetSession("manual-save-summary-session-project"); err != nil {
+	sess, err := s.GetSession("manual-save-summary-session-project")
+	if err != nil {
 		t.Fatalf("expected session manual-save-summary-session-project: %v", err)
 	}
+	if sess.Directory != dir {
+		t.Fatalf("expected directory=%q, got %q", dir, sess.Directory)
+	}
+	assertSessionSyncMutationDirectory(t, s, "manual-save-summary-session-project", dir)
 }
 
 func TestHandleCapturePassiveCreatesProjectScopedSession(t *testing.T) {

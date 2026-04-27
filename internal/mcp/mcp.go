@@ -55,6 +55,18 @@ var loadMCPStats = func(s *store.Store) (*store.Stats, error) {
 	return s.Stats()
 }
 
+func currentWorkingDirectory() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return cwd
+}
+
+func ensureImplicitSessionWithCWD(s *store.Store, sessionID, project string) error {
+	return s.CreateSession(sessionID, project, currentWorkingDirectory())
+}
+
 // ─── Tool Profiles ───────────────────────────────────────────────────────────
 //
 // "agent" — tools AI agents use during coding sessions:
@@ -925,8 +937,8 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 			}
 		}
 
-		// Ensure the session exists
-		s.CreateSession(sessionID, project, "")
+		// Ensure the implicit MCP session exists with the current working directory.
+		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
 
 		truncated := len(content) > s.MaxObservationLength()
 
@@ -1135,8 +1147,8 @@ func handleSavePrompt(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 			sessionID = defaultSessionID(project)
 		}
 
-		// Ensure the session exists
-		s.CreateSession(sessionID, project, "")
+		// Ensure the implicit MCP session exists with the current working directory.
+		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
 
 		_, err = s.AddPrompt(store.AddPromptParams{
 			SessionID: sessionID,
@@ -1376,8 +1388,8 @@ func handleSessionSummary(s *store.Store, cfg MCPConfig, activity *SessionActivi
 			sessionID = defaultSessionID(project)
 		}
 
-		// Ensure the session exists
-		s.CreateSession(sessionID, project, "")
+		// Ensure the implicit MCP session exists with the current working directory.
+		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
 
 		_, err = s.AddObservation(store.AddObservationParams{
 			SessionID: sessionID,
@@ -1481,7 +1493,7 @@ func handleCapturePassive(s *store.Store, cfg MCPConfig, activity *SessionActivi
 
 		if sessionID == "" {
 			sessionID = defaultSessionID(project)
-			_ = s.CreateSession(sessionID, project, "")
+			_ = ensureImplicitSessionWithCWD(s, sessionID, project)
 		}
 
 		if source == "" {
