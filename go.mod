@@ -12,7 +12,7 @@ require (
 	github.com/mark3labs/mcp-go v0.44.0
 	github.com/nguyenthenguyen/docx v0.0.0-20230621112118-9c8e795a11db
 	github.com/xuri/excelize/v2 v2.10.1
-	golang.org/x/net v0.52.0
+	golang.org/x/net v0.53.0
 	modernc.org/sqlite v1.45.0
 )
 
