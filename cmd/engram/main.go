@@ -718,15 +718,27 @@ func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (au
 }
 
 func cmdMCP(cfg store.Config) {
-	// Parse --tools flag. Project is always auto-detected from cwd at call time (JR2-4).
+	// Parse --tools and --project flags. Without --project, project is
+	// auto-detected from cwd at call time. --project (and ENGRAM_PROJECT)
+	// unblock callers in meta-monorepos with multiple subrepos and no root .git.
 	toolsFilter := ""
+	projectOverride := ""
 	for i := 2; i < len(os.Args); i++ {
-		if strings.HasPrefix(os.Args[i], "--tools=") {
+		switch {
+		case strings.HasPrefix(os.Args[i], "--tools="):
 			toolsFilter = strings.TrimPrefix(os.Args[i], "--tools=")
-		} else if os.Args[i] == "--tools" && i+1 < len(os.Args) {
+		case os.Args[i] == "--tools" && i+1 < len(os.Args):
 			toolsFilter = os.Args[i+1]
 			i++
+		case strings.HasPrefix(os.Args[i], "--project="):
+			projectOverride = strings.TrimPrefix(os.Args[i], "--project=")
+		case os.Args[i] == "--project" && i+1 < len(os.Args):
+			projectOverride = os.Args[i+1]
+			i++
 		}
+	}
+	if projectOverride != "" {
+		_ = os.Setenv("ENGRAM_PROJECT", projectOverride)
 	}
 
 	s, err := storeNew(cfg)

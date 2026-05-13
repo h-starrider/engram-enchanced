@@ -1738,7 +1738,21 @@ func (e *unknownProjectError) Error() string {
 
 // resolveWriteProject detects the current project from the process working
 // directory. Returns ErrAmbiguousProject if cwd is a parent of multiple repos.
+//
+// ENGRAM_PROJECT env var takes precedence over cwd detection. This unblocks
+// callers working from a parent directory that contains many subrepos (which
+// would otherwise hit Case 4 / ambiguous) and matches the behavior documented
+// in `engram help`.
 func resolveWriteProject() (projectpkg.DetectionResult, error) {
+	if env := strings.TrimSpace(os.Getenv("ENGRAM_PROJECT")); env != "" {
+		normalized, _ := store.NormalizeProject(env)
+		cwd, _ := os.Getwd()
+		return projectpkg.DetectionResult{
+			Project: normalized,
+			Source:  projectpkg.SourceEnvOverride,
+			Path:    cwd,
+		}, nil
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "."

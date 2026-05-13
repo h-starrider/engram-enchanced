@@ -974,23 +974,20 @@ func TestCmdProjectsAllNoGroups(t *testing.T) {
 }
 
 func TestCmdMCPDetectsProjectFromFlag(t *testing.T) {
-	// JR2-4: --project flag is no longer used (dead code removed). The --project flag
-	// is now silently ignored; project is auto-detected from cwd at each MCP call.
-	// This test verifies cmdMCP still starts correctly when an unknown flag is passed.
+	// --project=X on `engram mcp` exports ENGRAM_PROJECT=X so resolveWriteProject
+	// honors it for every MCP call in this process. Unblocks meta-monorepos with
+	// many subrepos and no root .git, which otherwise hit ambiguous_project.
 	cfg := testConfig(t)
+	t.Setenv("ENGRAM_PROJECT", "")
 
-	var capturedCfg mcp.MCPConfig
 	oldNew := newMCPServerWithConfig
 	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
 	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
-		capturedCfg = mcpCfg
-		// Return a valid server so serveMCP doesn't panic
 		return oldNew(s, mcpCfg, allowlist)
 	}
 
 	oldServe := serveMCP
 	t.Cleanup(func() { serveMCP = oldServe })
-	// Prevent actual stdio serve — return immediately
 	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
 		return nil
 	}
@@ -998,9 +995,34 @@ func TestCmdMCPDetectsProjectFromFlag(t *testing.T) {
 	withArgs(t, "engram", "mcp", "--project=myproject")
 	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
 
-	// JW6: MCPConfig.DefaultProject removed — verify cmdMCP still calls newMCPServerWithConfig.
-	// The project flag is parsed but project is now auto-detected per call, not stored in config.
-	_ = capturedCfg // MCPConfig{} — no fields to assert
+	if got := os.Getenv("ENGRAM_PROJECT"); got != "myproject" {
+		t.Errorf("--project=myproject should set ENGRAM_PROJECT; got %q", got)
+	}
+}
+
+// TestCmdMCPProjectFlagSpaceForm: `--project foo` (space separator) must also work.
+func TestCmdMCPProjectFlagSpaceForm(t *testing.T) {
+	cfg := testConfig(t)
+	t.Setenv("ENGRAM_PROJECT", "")
+
+	oldNew := newMCPServerWithConfig
+	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
+	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		return oldNew(s, mcpCfg, allowlist)
+	}
+
+	oldServe := serveMCP
+	t.Cleanup(func() { serveMCP = oldServe })
+	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
+		return nil
+	}
+
+	withArgs(t, "engram", "mcp", "--project", "spaced-form")
+	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
+
+	if got := os.Getenv("ENGRAM_PROJECT"); got != "spaced-form" {
+		t.Errorf("--project spaced-form should set ENGRAM_PROJECT; got %q", got)
+	}
 }
 
 func TestCmdMCPDetectsProjectFromEnv(t *testing.T) {

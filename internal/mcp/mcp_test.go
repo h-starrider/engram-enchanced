@@ -3273,6 +3273,110 @@ func TestResolveWriteProject_AmbiguousError(t *testing.T) {
 	}
 }
 
+// TestResolveWriteProject_EnvOverrideUnblocksAmbiguous: ENGRAM_PROJECT takes
+// precedence over cwd detection, including the ambiguous case (Case 4).
+// Documented in `engram help` but previously not wired into the MCP server.
+func TestResolveWriteProject_EnvOverrideUnblocksAmbiguous(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"repo-a", "repo-b"} {
+		child := filepath.Join(parent, name)
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initTestGitRepo(t, child)
+	}
+	t.Chdir(parent)
+	t.Setenv("ENGRAM_PROJECT", "MyMonorepo")
+
+	res, err := resolveWriteProject()
+	if err != nil {
+		t.Fatalf("resolveWriteProject with ENGRAM_PROJECT: %v", err)
+	}
+	if res.Project != "mymonorepo" {
+		t.Errorf("Project = %q; want normalized %q", res.Project, "mymonorepo")
+	}
+	if res.Source != project.SourceEnvOverride {
+		t.Errorf("Source = %q; want %q", res.Source, project.SourceEnvOverride)
+	}
+}
+
+// TestResolveWriteProject_EnvOverrideTrimmedEmpty: whitespace-only ENGRAM_PROJECT
+// must NOT mask cwd detection — it should behave as unset.
+func TestResolveWriteProject_EnvOverrideTrimmedEmpty(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	t.Chdir(dir)
+	t.Setenv("ENGRAM_PROJECT", "   ")
+
+	res, err := resolveWriteProject()
+	if err != nil {
+		t.Fatalf("resolveWriteProject: %v", err)
+	}
+	if res.Source == project.SourceEnvOverride {
+		t.Errorf("Source must NOT be env_override when env is whitespace-only; got %q", res.Source)
+	}
+}
+
+// TestMemSave_EnvOverrideInAmbiguousCwd: end-to-end — mem_save handler succeeds
+// in an otherwise-ambiguous cwd when ENGRAM_PROJECT is set, and the envelope
+// reports env_override as the source.
+func TestMemSave_EnvOverrideInAmbiguousCwd(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"repo-x", "repo-y"} {
+		child := filepath.Join(parent, name)
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initTestGitRepo(t, child)
+	}
+	t.Chdir(parent)
+	t.Setenv("ENGRAM_PROJECT", "ai-getleman-stack")
+
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "infra note",
+		"content": "cross-cutting observation",
+		"type":    "manual",
+	}}}
+	res, err := h(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success with ENGRAM_PROJECT set, got error: %s", callResultText(t, res))
+	}
+	text := callResultText(t, res)
+	if !strings.Contains(text, "ai-getleman-stack") {
+		t.Errorf("envelope must contain overridden project, got: %q", text)
+	}
+	if !strings.Contains(text, project.SourceEnvOverride) {
+		t.Errorf("envelope must report project_source=%q, got: %q", project.SourceEnvOverride, text)
+	}
+}
+
+// TestResolveReadProject_ExplicitOverrideBeatsEnv: when a read tool passes an
+// explicit project argument AND ENGRAM_PROJECT is set, the explicit arg wins.
+func TestResolveReadProject_ExplicitOverrideBeatsEnv(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("sess-arg", "from-arg", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("ENGRAM_PROJECT", "from-env")
+
+	res, err := resolveReadProject(s, "from-arg")
+	if err != nil {
+		t.Fatalf("resolveReadProject: %v", err)
+	}
+	if res.Project != "from-arg" {
+		t.Errorf("explicit arg must win over ENGRAM_PROJECT; got Project=%q", res.Project)
+	}
+}
+
 // TestResolveReadProject_WithOverride: known project override succeeds
 func TestResolveReadProject_WithOverride(t *testing.T) {
 	s := newMCPTestStore(t)
