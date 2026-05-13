@@ -3,6 +3,7 @@
 - branch-pr: clean branch and PR workflow.
 - testing-coverage: strict TDD and coverage discipline.
 - sdd-flow: mandatory Spec-Driven Development phases.
+- sdd-full: end-to-end SDD pipeline with --auto (zero confirmations, all 14/11 phases chained).
 - memory-protocol: persistent memory discipline.
 - commit-hygiene: clean conventional commits.
 - server-api: API contract + E2E guardrails.
