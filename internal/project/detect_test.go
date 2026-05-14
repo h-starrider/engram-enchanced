@@ -498,3 +498,141 @@ func TestDetectProject_AmbiguousEmpty(t *testing.T) {
 		t.Error("DetectProject must not return empty string on ambiguous cwd")
 	}
 }
+
+// ─── .engram-project file override tests ──────────────────────────────────────
+
+// writeProjectFile writes a .engram-project file in dir with the given content.
+func writeProjectFile(t *testing.T, dir, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, projectFileName), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDetectProjectFull_FileOverride_UnblocksAmbiguous: a `.engram-project`
+// file at the workspace root makes detection succeed even when the directory
+// has multiple git subrepos that would otherwise be ambiguous.
+func TestDetectProjectFull_FileOverride_UnblocksAmbiguous(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"repo-a", "repo-b"} {
+		child := filepath.Join(parent, name)
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initGit(t, child)
+	}
+	writeProjectFile(t, parent, "ai-getleman-stack")
+
+	got := DetectProjectFull(parent)
+	if got.Error != nil {
+		t.Fatalf("file override must clear ambiguity; got error: %v", got.Error)
+	}
+	if got.Project != "ai-getleman-stack" {
+		t.Errorf("Project = %q; want %q", got.Project, "ai-getleman-stack")
+	}
+	if got.Source != SourceFileOverride {
+		t.Errorf("Source = %q; want %q", got.Source, SourceFileOverride)
+	}
+}
+
+// TestDetectProjectFull_FileOverride_WalksUp: file at an ancestor wins from a
+// nested non-git subdir. Same behavior git uses to locate .git.
+func TestDetectProjectFull_FileOverride_WalksUp(t *testing.T) {
+	root := t.TempDir()
+	writeProjectFile(t, root, "monorepo")
+	nested := filepath.Join(root, "a", "b", "c")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got := DetectProjectFull(nested)
+	if got.Project != "monorepo" {
+		t.Errorf("walk-up Project = %q; want %q", got.Project, "monorepo")
+	}
+	if got.Source != SourceFileOverride {
+		t.Errorf("Source = %q; want %q", got.Source, SourceFileOverride)
+	}
+}
+
+// TestDetectProjectFull_FileOverride_DoesNotOverrideGitRoot: when cwd is
+// inside a git repo, git wins. The file at an ancestor (workspace root) is
+// only used when cwd is NOT inside any git repo. Critical to avoid leaking
+// the workspace name into subrepo-scoped observations.
+func TestDetectProjectFull_FileOverride_DoesNotOverrideGitRoot(t *testing.T) {
+	root := t.TempDir()
+	writeProjectFile(t, root, "workspace-name")
+
+	repo := filepath.Join(root, "subrepo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, repo)
+
+	got := DetectProjectFull(repo)
+	if got.Source != SourceGitRoot {
+		t.Errorf("inside subrepo: Source = %q; want %q", got.Source, SourceGitRoot)
+	}
+	if got.Project != "subrepo" {
+		t.Errorf("inside subrepo: Project = %q; want %q", got.Project, "subrepo")
+	}
+}
+
+// TestDetectProjectFull_FileOverride_EmptyIgnored: empty `.engram-project`
+// must NOT mask the next case.
+func TestDetectProjectFull_FileOverride_EmptyIgnored(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectFile(t, dir, "")
+
+	got := DetectProjectFull(dir)
+	if got.Source == SourceFileOverride {
+		t.Errorf("empty file must not produce file_override; got Source=%q Project=%q", got.Source, got.Project)
+	}
+}
+
+// TestDetectProjectFull_FileOverride_WhitespaceIgnored: same as empty.
+func TestDetectProjectFull_FileOverride_WhitespaceIgnored(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectFile(t, dir, "   \n\t  \n")
+
+	got := DetectProjectFull(dir)
+	if got.Source == SourceFileOverride {
+		t.Errorf("whitespace-only file must not produce file_override; got Source=%q Project=%q", got.Source, got.Project)
+	}
+}
+
+// TestDetectProjectFull_FileOverride_FirstLineOnly: only the first line is
+// read; subsequent lines are treated as user-comments and ignored.
+func TestDetectProjectFull_FileOverride_FirstLineOnly(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"r1", "r2"} {
+		child := filepath.Join(parent, name)
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initGit(t, child)
+	}
+	writeProjectFile(t, parent, "real-name\n# comment line below\nignored\n")
+
+	got := DetectProjectFull(parent)
+	if got.Project != "real-name" {
+		t.Errorf("first-line Project = %q; want %q", got.Project, "real-name")
+	}
+}
+
+// TestDetectProjectFull_FileOverride_Normalized: content is lowercased/trimmed.
+func TestDetectProjectFull_FileOverride_Normalized(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"r1", "r2"} {
+		child := filepath.Join(parent, name)
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initGit(t, child)
+	}
+	writeProjectFile(t, parent, "  MyWorkspace  \n")
+
+	got := DetectProjectFull(parent)
+	if got.Project != "myworkspace" {
+		t.Errorf("normalized Project = %q; want %q", got.Project, "myworkspace")
+	}
+}

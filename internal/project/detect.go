@@ -15,6 +15,16 @@ import (
 	"time"
 )
 
+// projectFileName is the per-workspace override file. Drop a single-line text
+// file with this name in any directory whose descendants want a fixed engram
+// project (walked up like git looks for .git). Empty/whitespace contents are
+// ignored.
+const projectFileName = ".engram-project"
+
+// projectFileMaxAncestors bounds the walk-up to guard against pathological
+// directory trees and symlink loops. 30 is well past any realistic nesting.
+const projectFileMaxAncestors = 30
+
 // ErrAmbiguousProject is returned when the working directory is a parent of
 // multiple git repositories and we cannot auto-select one.
 var ErrAmbiguousProject = errors.New("ambiguous project: multiple git repos found in cwd")
@@ -28,6 +38,7 @@ const (
 	SourceAmbiguous        = "ambiguous"         // cwd contains multiple git repos (Case 4)
 	SourceExplicitOverride = "explicit_override" // JR2-2: caller explicitly supplied a project name
 	SourceEnvOverride      = "env_override"      // ENGRAM_PROJECT env var supplied the project name
+	SourceFileOverride     = "file_override"     // .engram-project file in cwd or ancestor supplied the project name
 	SourceRequestBody      = "request_body"      // REQ-414: project came from the request body (server-side, no filesystem path)
 )
 
@@ -102,6 +113,19 @@ func DetectProjectFull(dir string) DetectionResult {
 		}
 	}
 
+	// ── Case 2b: .engram-project file walk-up ──────────────────────────
+	// Only applies when cwd is NOT inside a git repo (cases 1/2 already
+	// returned). Lets meta-monorepos with N subrepos and no root .git
+	// declare their workspace name explicitly without needing ENGRAM_PROJECT
+	// in every MCP config and shell.
+	if name, foundDir := detectFromProjectFile(dir); name != "" {
+		return DetectionResult{
+			Project: normalize(name),
+			Source:  SourceFileOverride,
+			Path:    foundDir,
+		}
+	}
+
 	// ── Cases 3 & 4: scan child directories ────────────────────────────
 	children, timedOut := scanChildren(dir)
 	if timedOut {
@@ -153,6 +177,40 @@ basename:
 		Source:  SourceDirBasename,
 		Path:    absDir,
 	}
+}
+
+// detectFromProjectFile walks up from dir looking for a `.engram-project`
+// file. Returns the trimmed first non-empty line of the file and the directory
+// where the file was found. Returns ("", "") if no file is found, the file is
+// empty/whitespace-only, or the walk exceeds projectFileMaxAncestors.
+//
+// Walking up mirrors how git locates .git: lets a single file at the workspace
+// root configure every nested subdir without needing one file per level.
+func detectFromProjectFile(dir string) (name string, foundDir string) {
+	cur, err := filepath.Abs(dir)
+	if err != nil {
+		return "", ""
+	}
+	for i := 0; i < projectFileMaxAncestors; i++ {
+		filePath := filepath.Join(cur, projectFileName)
+		data, err := os.ReadFile(filePath)
+		if err == nil {
+			// Take only the first line so users can comment below the name
+			// if they ever want to (we ignore extra lines).
+			first := strings.SplitN(string(data), "\n", 2)[0]
+			first = strings.TrimSpace(first)
+			if first != "" {
+				return first, cur
+			}
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// Reached filesystem root.
+			return "", ""
+		}
+		cur = parent
+	}
+	return "", ""
 }
 
 // detectGitRootDir returns the git repository root for dir, or "" if not in a repo.
